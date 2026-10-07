@@ -1196,3 +1196,73 @@ test('reviews semantic React diff gutters and navigates validated references on 
   assert.equal(viewed.checked, true);
   assert.deepEqual(current.errors, []);
 });
+
+test('recovers from an invalidated extension without crashing on review or cancellation', async t => {
+  const notice = 'PR Reviewer was updated or reloaded. Reload this GitHub tab to reconnect.';
+  for (const mode of ['synchronous throw', 'rejected promise']) await t.test(mode, async sub => {
+    const fixturePaths = ['src/first.ts', 'src/second.ts'];
+    const failed: ExtensionRequest[] = [];
+    const uncaught: unknown[] = [];
+    const html = `
+      <a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">2</span></a>
+      <main id="native-files">${fixturePaths.map((path, index) => `
+        <div class="js-file" data-tagsearch-path="${path}" id="${anchor(index)}">
+          <div class="file-header" data-path="${path}" data-anchor="${anchor(index)}"><a href="#${anchor(index)}" title="${path}">${path}</a></div>
+          <table><tbody><tr><td class="blob-num" data-line-number="1">1</td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">export const value = ${index};</span></td></tr></tbody></table>
+        </div>`).join('')}</main>
+      <textarea aria-label="Review comment">Draft before extension reload</textarea><input type="checkbox" aria-label="Viewed" checked>`;
+    const current = page(undefined, {}, html, message => {
+      if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: 'en' } };
+    }, window => {
+      const send = window.chrome.runtime.sendMessage;
+      Object.defineProperty(window.chrome.runtime, 'sendMessage', { value: (message: ExtensionRequest) => {
+        if (message.type !== 'ai-review' && message.type !== 'ai-cancel') return send(message);
+        failed.push(structuredClone(message));
+        const error = new window.Error('Extension context invalidated.');
+        if (mode === 'synchronous throw') throw error;
+        return Promise.reject(error);
+      } });
+      window.addEventListener('error', event => uncaught.push(event.error ?? event.message));
+      window.addEventListener('unhandledrejection', event => uncaught.push(event.reason));
+    });
+    sub.after(() => current.dom.window.close());
+    const native = current.window.document.querySelector('#native-files')!;
+    const nativeHTML = native.innerHTML;
+    const draft = current.window.document.querySelector('textarea')!;
+    const viewed = current.window.document.querySelector<HTMLInputElement>('input[aria-label="Viewed"]')!;
+    const nativeLinks = [...native.querySelectorAll<HTMLAnchorElement>('.file-header a')];
+    for (const link of nativeLinks) link.addEventListener('click', event => {
+      event.preventDefault();
+      current.window.history.replaceState({}, '', link.getAttribute('href')!);
+    });
+    const shadow = await openPanel(current.window);
+    const panel = shadow.querySelector('aside')!;
+    await until(() => links(shadow).length === 2, 'reload recovery fixture inventory');
+    nativeLinks[0].click();
+    const assertRecovery = async (path: string) => {
+      await until(() => shadow.querySelector('.ai-error')?.textContent === notice && shadow.querySelector('.ai-file')?.getAttribute('title') === path, 'friendly invalidated-context recovery');
+      assert.equal(shadow.querySelector<HTMLElement>('.ai-review')?.hidden, false);
+      assert.equal(shadow.querySelector('.ai-error')?.getAttribute('role'), 'alert');
+      const reload = [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Reload GitHub tab');
+      assert.ok(reload && !reload.disabled, 'The recovery button lets the user reload the GitHub tab');
+      assert.equal([...shadow.querySelectorAll('button')].some(button => button.textContent === 'Retry review'), false);
+      assert.equal(shadow.textContent?.includes('Extension context invalidated'), false);
+      assert.strictEqual(shadow.querySelector('aside'), panel);
+      assert.equal(draft.value, 'Draft before extension reload');
+      assert.equal(viewed.checked, true);
+    };
+    await assertRecovery(fixturePaths[0]);
+    const first = failed.find(message => message.type === 'ai-review');
+    assert.ok(first?.type === 'ai-review');
+    nativeLinks[1].click();
+    await assertRecovery(fixturePaths[1]);
+    assert.ok(failed.some(message => message.type === 'ai-cancel' && message.requestId === first.requestId), 'Switching files safely handles invalidated cancellation cleanup');
+    assert.equal(failed.filter(message => message.type === 'ai-review').length, 2);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.deepEqual(uncaught, []);
+    assert.deepEqual(current.errors, []);
+    assert.equal(native.innerHTML, nativeHTML);
+    assert.strictEqual(current.window.document.querySelector('textarea'), draft);
+    assert.strictEqual(current.window.document.querySelector('input[aria-label="Viewed"]'), viewed);
+  });
+});

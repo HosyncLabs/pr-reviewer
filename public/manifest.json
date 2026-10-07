@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "140",
   "name": "PR Reviewer · Organizer",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Organizes GitHub PR files and optionally reviews selected diffs with your OpenAI API key.",
   "permissions": ["storage"],
   "optional_host_permissions": ["https://api.openai.com/*"],

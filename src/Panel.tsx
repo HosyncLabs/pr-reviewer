@@ -6,7 +6,7 @@ import {
 import { navigateToFile, type PullRequest, type PullRequestFile } from './github';
 import { loadPreferences, saveOverride, saveImplementationOverride, subscribePreferences, type RepositoryPreferences } from './storage';
 import { AiReview } from './AiReview';
-import { CONTENT_VERSION, type AIStatus } from './ai-protocol';
+import { CONTENT_VERSION, EXTENSION_RELOAD_NOTICE, sendExtensionMessage, type AIStatus } from './ai-protocol';
 
 export type Snapshot = { pr: PullRequest; files: PullRequestFile[]; expected: number | null; comparison: string };
 const symbols = { documentation: '▤', implementation: '〈〉', migrations: '▦', tests: '✓' };
@@ -176,9 +176,9 @@ export function Panel({ pr, files, expected, comparison }: Snapshot) {
       <header className="brand-bar">
         <div className="brand"><span className="brand-mark" aria-hidden="true">▥</span> PR Reviewer <span className="local-badge" title={`Content UI version ${CONTENT_VERSION}`}>LOCAL · {CONTENT_VERSION}</span></div>
         <button className="ai-settings-button" hidden={view === 'ai'} onClick={() => {
-          void chrome.runtime.sendMessage({ type: 'ai-open-settings' }).then(response => {
+          void sendExtensionMessage({ type: 'ai-open-settings' }).then(response => {
             if (!response?.ok) setError('Could not open AI settings. Reload the GitHub tab and try again.');
-          }).catch(() => setError('Could not open AI settings. Reload the GitHub tab and try again.'));
+          }).catch(cause => setError(cause instanceof Error && cause.message === EXTENSION_RELOAD_NOTICE ? cause.message : 'Could not open AI settings. Reload the GitHub tab and try again.'));
         }}>AI settings</button>
         <button className="icon-button" aria-label="Close panel" onClick={close}>×</button>
       </header>

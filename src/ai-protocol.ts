@@ -1,7 +1,7 @@
 import type { Category, ImplementationGroup } from './classifier';
 import type { RepositoryPreferences } from './storage';
 
-export const CONTENT_VERSION = '0.1.3';
+export const CONTENT_VERSION = '0.1.4';
 export const DEFAULT_AI_MODEL = 'gpt-6-luna';
 export type AILanguage = 'en' | 'es';
 export const DEFAULT_AI_LANGUAGE: AILanguage = 'en';
@@ -9,6 +9,7 @@ export const AI_LANGUAGE_LABELS: Record<AILanguage, string> = { en: 'English', e
 export const isAILanguage = (value: unknown): value is AILanguage => value === 'en' || value === 'es';
 export const AI_STATUS_NOTICE = 'pr-reviewer:ai-status-change';
 export const PREFERENCES_NOTICE = 'pr-reviewer:preferences-change';
+export const EXTENSION_RELOAD_NOTICE = 'PR Reviewer was updated or reloaded. Reload this GitHub tab to reconnect.';
 export const OPENAI_ORIGIN = 'https://api.openai.com/*';
 
 export type AIReviewContext = { path: string; diff: string; partial: boolean };
@@ -29,3 +30,14 @@ export type ExtensionRequest =
 export type ExtensionResponse =
   | { ok: true; status?: AIStatus; review?: AIReviewResult; preferences?: RepositoryPreferences }
   | { ok: false; error: string };
+
+export async function sendExtensionMessage(message: ExtensionRequest): Promise<ExtensionResponse> {
+  try {
+    return await chrome.runtime.sendMessage(message);
+  } catch (cause) {
+    if (/extension context invalidated/i.test(cause instanceof Error ? cause.message : String(cause))) {
+      throw new Error(EXTENSION_RELOAD_NOTICE);
+    }
+    throw cause;
+  }
+}

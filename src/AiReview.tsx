@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent } from 'react';
-import { AI_LANGUAGE_LABELS, AI_STATUS_NOTICE, isAILanguage, type AIReviewComment, type AIReviewContext, type AIReviewLine, type AIReviewResult, type AIStatus, type ExtensionResponse } from './ai-protocol';
+import { AI_LANGUAGE_LABELS, AI_STATUS_NOTICE, EXTENSION_RELOAD_NOTICE, isAILanguage, sendExtensionMessage, type AIReviewComment, type AIReviewContext, type AIReviewLine, type AIReviewResult, type AIStatus } from './ai-protocol';
 import type { PullRequestFile } from './github';
 import { collectReviewContext } from './review-context';
 import { navigateToReviewLine, reviewLineHash } from './review-navigation';
@@ -60,7 +60,7 @@ export function AiReview({ file, selection, comparison, visible, onAutomatic, on
     setReview(null); setContext(null); setError(''); setPhase('idle');
     const run = async () => {
       try {
-        const response = await chrome.runtime.sendMessage({ type: 'ai-status' }) as ExtensionResponse;
+        const response = await sendExtensionMessage({ type: 'ai-status' });
         if (controller.signal.aborted) return;
         if (!response.ok || !response.status) throw new Error(response.ok ? 'Could not read AI settings.' : response.error);
         if (!isAILanguage(response.status.language)) {
@@ -75,7 +75,7 @@ export function AiReview({ file, selection, comparison, visible, onAutomatic, on
         const current = await collectReviewContext(file, document, controller.signal);
         if (controller.signal.aborted) return;
         setContext(current); setPhase('generating'); sent = true;
-        const result = await chrome.runtime.sendMessage({ type: 'ai-review', requestId, context: current }) as ExtensionResponse;
+        const result = await sendExtensionMessage({ type: 'ai-review', requestId, context: current });
         if (controller.signal.aborted) return;
         if (!result.ok || !result.review) throw new Error(result.ok ? 'OpenAI returned an invalid review.' : result.error);
         if (!hasStructuredComments(result.review)) throw new Error('Reload PR Reviewer in chrome://extensions, then reload this GitHub tab to apply AI line references.');
@@ -89,16 +89,16 @@ export function AiReview({ file, selection, comparison, visible, onAutomatic, on
     void run();
     return () => {
       controller.abort();
-      if (sent) void chrome.runtime.sendMessage({ type: 'ai-cancel', requestId }).catch(() => {});
+      if (sent) void sendExtensionMessage({ type: 'ai-cancel', requestId }).catch(() => {});
     };
   }, [file?.path, file?.anchor, selection, comparison, refresh, onAutomatic, onStatus]);
 
   const openSettings = async () => {
     try {
-      const response = await chrome.runtime.sendMessage({ type: 'ai-open-settings' }) as ExtensionResponse;
+      const response = await sendExtensionMessage({ type: 'ai-open-settings' });
       if (!response.ok) throw new Error(response.error);
-    } catch {
-      setError('Could not open AI settings. Reload the GitHub tab and try again.');
+    } catch (cause) {
+      setError(cause instanceof Error && cause.message === EXTENSION_RELOAD_NOTICE ? cause.message : 'Could not open AI settings. Reload the GitHub tab and try again.');
     }
   };
 
@@ -128,7 +128,8 @@ export function AiReview({ file, selection, comparison, visible, onAutomatic, on
     {(phase === 'reading' || phase === 'generating') && <p className="ai-loading" role="status">{phase === 'reading' ? 'Reading file changes…' : 'Generating review…'}</p>}
     {error && <p className="ai-error" role="alert">{error}</p>}
     {navigationStatus && <p className="ai-navigation-status" role="status" lang="en">{navigationStatus}</p>}
-    {(phase === 'error' || phase === 'done') && file && status?.configured && status.enabled && <button className="ai-retry" onClick={() => setRefresh(value => value + 1)}>{phase === 'done' ? 'Refresh review' : 'Retry review'}</button>}
+    {error === EXTENSION_RELOAD_NOTICE ? <button className="ai-retry" onClick={() => location.reload()}>Reload GitHub tab</button> :
+      (phase === 'error' || phase === 'done') && file && status?.configured && status.enabled && <button className="ai-retry" onClick={() => setRefresh(value => value + 1)}>{phase === 'done' ? 'Refresh review' : 'Retry review'}</button>}
     {review && file && context?.path === file.path && <div className="ai-result" lang={status?.language}>
       <div className="ai-summary-card"><span className="ai-kicker" lang="en">Summary</span><p className="ai-summary">{review.summary}</p></div>
       <section className="ai-highlights" aria-labelledby="ai-highlights-heading">

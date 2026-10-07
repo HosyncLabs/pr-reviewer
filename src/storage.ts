@@ -1,5 +1,5 @@
 import { isCategory, isImplementationGroup, type Category, type ClassificationRule, type ImplementationGroup } from './classifier';
-import { AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE, isAILanguage, type AILanguage, type ExtensionRequest, type ExtensionResponse } from './ai-protocol';
+import { AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE, isAILanguage, sendExtensionMessage, type AILanguage, type ExtensionRequest } from './ai-protocol';
 
 export type RepositoryPreferences = {
   overrides: Record<string, Category>;
@@ -63,7 +63,7 @@ export async function saveImplementationOverrideTrusted(repository: string, path
 }
 
 async function requestPreferences(message: ExtensionRequest): Promise<RepositoryPreferences> {
-  const response: ExtensionResponse = await chrome.runtime.sendMessage(message);
+  const response = await sendExtensionMessage(message);
   if (!response?.ok) throw new Error(response?.error ?? 'The extension is unavailable. Reload this GitHub tab.');
   if (!response.preferences) throw new Error('Could not load your local preferences.');
   return response.preferences;
