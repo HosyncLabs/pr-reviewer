@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI settings · PR Reviewer</title>
+  <link rel="stylesheet" href="options.css">
+  <script defer src="options.js"></script>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">PR Reviewer</p>
+    <h1>AI settings</h1>
+    <p>Use your OpenAI API key to review the file you open in a pull request.</p>
+    <form id="settings">
+      <label for="api-key">OpenAI API key</label>
+      <input id="api-key" type="password" maxlength="512" autocomplete="off" spellcheck="false" placeholder="Enter a key to add or replace it" aria-describedby="saved-key key-storage">
+      <p id="saved-key" class="hint">Loading secure settings…</p>
+      <p id="key-storage" class="hint">Your key is stored locally in Chrome extension storage. It is not encrypted and is never exposed to GitHub or the page's content script.</p>
+      <label for="model">OpenAI model</label>
+      <select id="model" aria-describedby="model-hint">
+        <option value="gpt-6-luna">GPT-6 Luna (default)</option>
+        <option value="gpt-6.1-sol">GPT-6.1 Sol</option>
+        <option value="gpt-6-astra">GPT-6 Astra</option>
+        <option value="custom">Custom model…</option>
+      </select>
+      <p id="model-hint" class="hint">Your selection is used for every file review. Availability depends on your OpenAI account.</p>
+      <div id="custom-model-field" hidden>
+        <label for="custom-model">Custom model ID</label>
+        <input id="custom-model" type="text" maxlength="100" autocomplete="off" spellcheck="false" placeholder="Enter an OpenAI model ID" aria-describedby="custom-model-hint">
+        <p id="custom-model-hint" class="hint">Use a model that supports Responses structured outputs and low reasoning effort.</p>
+      </div>
+      <label for="language">AI response language</label>
+      <select id="language" aria-describedby="language-hint">
+        <option value="en">English</option>
+        <option value="es">Español</option>
+      </select>
+      <p id="language-hint" class="hint">Use this language for summaries, highlights, and review focus. The extension interface stays in English.</p>
+      <label class="checkbox"><input id="enabled" type="checkbox"> Enable automatic AI when opening files</label>
+      <p class="notice">When enabled, opening a file sends its path and available diff to OpenAI. The diff may be incomplete. OpenAI API charges apply. The extension does not post comments or change your review.</p>
+      <div class="actions">
+        <button id="save" type="submit" disabled>Save settings</button>
+        <button id="remove-key" type="button" disabled>Remove API key</button>
+      </div>
+      <p id="status" role="status" aria-live="polite"></p>
+    </form>
+  </main>
+</body>
+</html>

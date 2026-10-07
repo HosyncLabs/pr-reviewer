@@ -1,0 +1,1020 @@
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import test from 'node:test';
+import { JSDOM, VirtualConsole } from 'jsdom';
+import { AI_STATUS_NOTICE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE, type AILanguage, type ExtensionRequest, type ExtensionResponse } from '../src/ai-protocol';
+import { isCategory, isImplementationGroup, type Category, type ClassificationRule, type ImplementationGroup } from '../src/classifier';
+import type { RepositoryPreferences } from '../src/storage';
+
+const bundle = await readFile(new URL('../dist/content.js', import.meta.url), 'utf8');
+const initialPaths = ['README.md', 'src/client.ts', 'tests/client.test.ts'];
+const anchor = (index: number) => `diff-${String(index + 1).padStart(64, '0')}`;
+const filesHTML = (paths: string[]) => paths.map((path, index) => `
+  <div class="js-file" data-tagsearch-path="${path}" id="${anchor(index)}">
+    <div class="file-header" data-path="${path}" data-anchor="${anchor(index)}">
+      <a href="#${anchor(index)}" title="${path}">${path}</a>
+      <label><input type="checkbox" aria-label="Viewed"> Viewed</label>
+    </div>
+    <table><tbody><tr><td>Native diff for ${path}</td></tr></tbody></table>
+    <textarea aria-label="Review comment"></textarea>
+  </div>`).join('');
+
+// Metadata observed in GitHub's React large-PR view: the tree keeps all paths
+// while only the current diff regions are mounted.
+const treeHTML = (paths: string[]) => `<ul role="tree" aria-label="File Tree" data-truncate-text="true">${paths.map((path, index) => `
+  <li role="treeitem" id="${path}" aria-level="3" aria-label="${path.slice(path.lastIndexOf('/') + 1)}" aria-selected="false" tabindex="-1">
+    <a data-component="Link" data-muted="true" href="#${anchor(index)}" role="presentation" tabindex="-1">${path.slice(path.lastIndexOf('/') + 1)}</a>
+  </li>`).join('')}</ul>`;
+const regionHTML = (path: string, index: number) => `
+  <div role="region" aria-labelledby="heading-${index}" id="${anchor(index)}" data-estimated-height="1817">
+    <h3 id="heading-${index}"><a data-component="Link" href="#${anchor(index)}"><code>\u200e${path}\u200e</code></a></h3>
+    <table><tbody><tr><td>Native diff for ${path}</td></tr></tbody></table>
+  </div>`;
+
+type Storage = Record<string, unknown>;
+type RuntimeHandler = (message: ExtensionRequest) => ExtensionResponse | void | Promise<ExtensionResponse | void>;
+
+function page(url = 'https://github.com/acme/example/pull/12/files', stored: Storage = {}, html?: string, runtimeHandler?: RuntimeHandler, beforeEval?: (window: JSDOM['window']) => void) {
+  const errors: Error[] = [];
+  const listeners = new Set<(changes: Record<string, { newValue?: unknown }>, area: string) => void>();
+  const messages: ExtensionRequest[] = [];
+  let nonce = 0;
+  const notify = (key: string, value: Record<string, unknown>) => {
+    for (const listener of listeners) listener({ [key]: { newValue: { ...value, nonce: String(++nonce) } } }, 'session');
+  };
+  const preferences = (repository: string): RepositoryPreferences => {
+    const key = `pr-reviewer:repo:${repository.toLowerCase()}`;
+    const overridePrefix = `${key}:file:`;
+    const implementationPrefix = `${key}:implementation:`;
+    const raw = stored[key] as { rules?: unknown } | undefined;
+    const overrides: Record<string, Category> = {};
+    const implementationOverrides: Record<string, ImplementationGroup> = {};
+    for (const [name, value] of Object.entries(stored)) {
+      if (name.startsWith(overridePrefix) && isCategory(value)) overrides[name.slice(overridePrefix.length)] = value;
+      if (name.startsWith(implementationPrefix) && isImplementationGroup(value)) implementationOverrides[name.slice(implementationPrefix.length)] = value;
+    }
+    const rules = Array.isArray(raw?.rules) ? raw.rules.filter((rule: unknown): rule is ClassificationRule =>
+      !!rule && typeof rule === 'object' && 'pattern' in rule && typeof rule.pattern === 'string' && 'category' in rule && isCategory(rule.category)) : [];
+    return {
+      overrides, implementationOverrides, rules: structuredClone(rules),
+    };
+  };
+  const virtualConsole = new VirtualConsole();
+  virtualConsole.on('jsdomError', error => errors.push(error));
+  const dom = new JSDOM(`<html><body>${html ?? `
+    <a class="tabnav-tab" href="${new URL(url).pathname}"><span id="files_tab_counter" title="${initialPaths.length}">${initialPaths.length}</span></a>
+    <main id="native-files">${filesHTML(initialPaths)}</main>
+  `}</body></html>`, { url, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole });
+  const { window } = dom;
+  Object.assign(window, {
+    matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
+    chrome: {
+      runtime: { sendMessage: async (message: ExtensionRequest): Promise<ExtensionResponse> => {
+        messages.push(structuredClone(message));
+        const response = await runtimeHandler?.(message);
+        if (response) return response;
+        if (message.type === 'ai-status') return { ok: true, status: { configured: false, enabled: false, model: DEFAULT_AI_MODEL, language: 'en' } };
+        if (message.type === 'ai-open-settings' || message.type === 'ai-cancel') return { ok: true };
+        if (message.type === 'ai-review') return { ok: false, error: 'AI review is not configured in this test.' };
+        if (message.type !== 'preferences-load') {
+          const key = `pr-reviewer:repo:${message.repository.toLowerCase()}:${message.type === 'preferences-category' ? 'file' : 'implementation'}:${message.path}`;
+          const value = message.type === 'preferences-category' ? message.category : message.group;
+          if (value) stored[key] = value;
+          else delete stored[key];
+          notify(PREFERENCES_NOTICE, { repository: message.repository.toLowerCase() });
+        }
+        return { ok: true, preferences: preferences(message.repository) };
+      } },
+      storage: { local: { get: async () => { throw new Error('Content scripts cannot read protected local storage.'); } }, onChanged: {
+        addListener: (listener: (changes: Record<string, { newValue?: unknown }>, area: string) => void) => listeners.add(listener),
+        removeListener: (listener: (changes: Record<string, { newValue?: unknown }>, area: string) => void) => listeners.delete(listener),
+      } },
+    },
+  });
+  window.HTMLElement.prototype.scrollIntoView = function () {};
+  beforeEval?.(window);
+  window.eval(bundle);
+  return { dom, window, stored, errors, messages, notifyAI: () => notify(AI_STATUS_NOTICE, {}) };
+}
+
+async function until<T>(read: () => T | null | undefined | false, description: string): Promise<T> {
+  const deadline = Date.now() + 4_000;
+  while (Date.now() < deadline) {
+    const value = read();
+    if (value) return value;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  assert.fail(`Timed out: ${description}`);
+}
+
+async function openPanel(window: JSDOM['window']) {
+  const shadow = await until(() => window.document.querySelector('#pr-reviewer-root')?.shadowRoot, 'extension host');
+  const launcher = await until(() => shadow.querySelector<HTMLButtonElement>('button.launcher'), 'launcher');
+  if (launcher.getAttribute('aria-expanded') !== 'true') launcher.click();
+  await until(() => shadow.querySelector('aside[aria-label="Pull request organizer"]'), 'panel');
+  return shadow;
+}
+
+const links = (root: ParentNode) => [...root.querySelectorAll<HTMLAnchorElement>('a.file-link')];
+const paths = (root: ParentNode) => links(root).map(link => link.title).sort();
+const reviewComment = (text: string, side: 'left' | 'right' = 'right') => ({ text, lines: [{ side, line: 1 }] });
+
+test('isolates editable panel keyboard events from GitHub shortcuts without cancelling editing defaults', async t => {
+  const observed: string[] = [];
+  const beforeEval = (window: JSDOM['window']) => {
+    assert.equal(window.document.readyState, 'loading');
+    const body = window.document.body;
+    body.remove();
+    window.document.addEventListener('DOMContentLoaded', () => window.document.documentElement.append(body), { once: true });
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      window.document.addEventListener(type, () => observed.push(`document capture ${type}`), true);
+      window.document.addEventListener(type, () => observed.push(`document bubble ${type}`));
+      window.addEventListener(type, () => observed.push(`window bubble ${type}`));
+    }
+  };
+  const current = page(undefined, {}, undefined, undefined, beforeEval);
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  for (const type of ['keydown', 'keypress', 'keyup']) {
+    // document_start places the extension's window guard before GitHub's window handlers.
+    window.addEventListener(type, () => observed.push(`window capture ${type}`), true);
+  }
+  const shadow = await openPanel(window);
+  await until(() => links(shadow).length === initialPaths.length, 'keyboard fixture inventory after DOM load');
+  const search = shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!;
+  const dispatchKeys = (target: Element, key: string, modifiers: KeyboardEventInit = {}) => {
+    for (const type of ['keydown', 'keypress', 'keyup']) {
+      const event = new window.KeyboardEvent(type, { key, bubbles: true, composed: true, cancelable: true, ...modifiers });
+      assert.equal(target.dispatchEvent(event), true, `${key} ${type} remains available to native editing`);
+      assert.equal(event.defaultPrevented, false);
+    }
+  };
+  for (const [key, modifiers] of [
+    ['c', {}], ['C', { shiftKey: true }], ['g', {}], ['?', { shiftKey: true }],
+    ['ArrowDown', {}], ['ArrowUp', {}], ['ArrowLeft', {}], ['ArrowRight', {}], ['Tab', {}],
+    ['a', { metaKey: true }], ['v', { metaKey: true }], ['v', { ctrlKey: true }],
+  ] as const) dispatchKeys(search, key, modifiers);
+  const paste = new window.Event('paste', { bubbles: true, composed: true, cancelable: true });
+  assert.equal(search.dispatchEvent(paste), true);
+  assert.equal(paste.defaultPrevented, false);
+  Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!.call(search, 'client');
+  search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await until(() => links(shadow).length === 2, 'search remains functional after guarded typing and paste');
+  assert.deepEqual(paths(shadow), ['src/client.ts', 'tests/client.test.ts']);
+  assert.deepEqual(observed, []);
+
+  const category = shadow.querySelector<HTMLSelectElement>('select[aria-label="Category for src/client.ts"]')!;
+  category.closest('details')!.open = true;
+  await until(() => !category.disabled, 'select preferences loaded');
+  category.focus();
+  for (const key of ['t', 'ArrowDown', 'Tab']) dispatchKeys(category, key);
+  assert.deepEqual(observed, []);
+  search.focus();
+  dispatchKeys(search, 'Escape', { keyCode: 229 });
+  dispatchKeys(search, 'Escape', { isComposing: true });
+  assert.ok(shadow.querySelector('aside'));
+  assert.deepEqual(observed, []);
+
+  const outside = window.document.querySelector('textarea')!;
+  dispatchKeys(outside, 'c');
+  assert.equal(observed.length, 12);
+  observed.length = 0;
+  dispatchKeys(links(shadow)[0], 'g');
+  assert.equal(observed.length, 12);
+  observed.length = 0;
+
+  search.focus();
+  search.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'Escape', bubbles: true, composed: true, cancelable: true }));
+  await until(() => !shadow.querySelector('aside'), 'Escape closes the local panel');
+  assert.strictEqual(shadow.activeElement, shadow.querySelector('button.launcher'));
+  assert.equal(shadow.querySelector('button.launcher')?.getAttribute('aria-expanded'), 'false');
+  assert.deepEqual(observed, []);
+  window.dispatchEvent(new window.Event('pagehide'));
+  await until(() => !window.document.querySelector('#pr-reviewer-root'), 'guarded panel unmounted on page hide');
+  dispatchKeys(outside, 'c');
+  assert.equal(observed.length, 12);
+  assert.deepEqual(current.errors, []);
+});
+
+test('organizes loaded files, persists corrections, and preserves native review state', async t => {
+  const current = page();
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  const native = window.document.querySelector('#native-files')!;
+  const tables = [...native.querySelectorAll('table')];
+  const draft = native.querySelector('textarea')!;
+  const viewed = native.querySelector<HTMLInputElement>('input')!;
+  draft.value = 'My unfinished review';
+  viewed.checked = true;
+
+  const shadow = await openPanel(window);
+  await until(() => links(shadow).length === initialPaths.length, 'initial file list');
+  assert.deepEqual(paths(shadow), [...initialPaths].sort());
+  assert.equal(shadow.querySelectorAll('details.group').length, 4);
+  for (const label of ['Documentation', 'Implementation', 'Tests', 'Migrations']) {
+    assert.ok([...shadow.querySelectorAll('details.group > summary')].some(summary => summary.textContent?.includes(label)));
+  }
+
+  const search = shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!;
+  const setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+  setValue.call(search, 'CLIENT');
+  search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await until(() => links(shadow).length === 2, 'search results');
+  assert.deepEqual(paths(shadow), ['src/client.ts', 'tests/client.test.ts']);
+  setValue.call(search, '');
+  search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await until(() => links(shadow).length === 3, 'cleared search');
+
+  const implementation = shadow.querySelector<HTMLDetailsElement>('details.group.implementation')!;
+  implementation.open = false;
+  assert.equal(implementation.open, false);
+  implementation.open = true;
+  const correction = shadow.querySelector<HTMLSelectElement>('select[aria-label="Category for src/client.ts"]')!;
+  correction.closest('details')!.open = true;
+  await until(() => !correction.disabled, 'loaded preferences');
+  correction.value = 'documentation';
+  correction.dispatchEvent(new window.Event('change', { bubbles: true }));
+  await until(() => shadow.querySelector('details.group.documentation a[title="src/client.ts"]'), 'corrected category');
+
+  native.insertAdjacentHTML('beforeend', filesHTML(['src/extra.ts']).replaceAll(anchor(0), anchor(3)));
+  window.document.querySelector('#files_tab_counter')!.textContent = '4';
+  window.document.querySelector('#files_tab_counter')!.setAttribute('title', '4');
+  await until(() => links(shadow).length === 4, 'dynamically loaded file');
+  assert.equal(links(shadow).filter(link => link.title === 'src/extra.ts').length, 1);
+  assert.deepEqual([...native.querySelectorAll('table')].slice(0, 3), tables);
+  assert.strictEqual(native.querySelector('textarea'), draft);
+  assert.equal(draft.value, 'My unfinished review');
+  assert.strictEqual(native.querySelector('input'), viewed);
+  assert.equal(viewed.checked, true);
+
+  const panel = shadow.querySelector('aside')!;
+  const clientLink = links(shadow).find(link => link.title === 'src/client.ts')!;
+  clientLink.click();
+  await until(() => window.location.hash === `#${anchor(1)}`, 'native anchor navigation');
+  await until(() => clientLink.closest('li')!.classList.contains('selected'), 'selected file stays visible');
+  assert.strictEqual(shadow.querySelector('aside'), panel);
+  assert.strictEqual(shadow.activeElement, clientLink);
+  assert.equal(window.location.hash, `#${anchor(1)}`);
+  assert.equal(draft.value, 'My unfinished review');
+  assert.equal(viewed.checked, true);
+  shadow.querySelector<HTMLButtonElement>('button[aria-label="Close panel"]')!.click();
+  await until(() => !shadow.querySelector('aside'), 'explicit close still closes panel');
+
+  const reload = page(undefined, current.stored);
+  t.after(() => reload.dom.window.close());
+  const reloadedShadow = await openPanel(reload.window);
+  await until(() => reloadedShadow.querySelector('details.group.documentation a[title="src/client.ts"]'), 'saved correction on reload');
+
+  const other = page('https://github.com/acme/other/pull/12/files', current.stored);
+  t.after(() => other.dom.window.close());
+  const otherShadow = await openPanel(other.window);
+  await until(() => otherShadow.querySelector<HTMLSelectElement>('select[aria-label="Category for src/client.ts"]')?.disabled === false, 'other repository preferences');
+  assert.ok(otherShadow.querySelector('details.group.implementation a[title="src/client.ts"]'));
+  for (const result of [current, reload, other]) assert.equal(result.messages.some(message => message.type === 'ai-review'), false);
+  assert.deepEqual(current.errors, []);
+  assert.deepEqual(reload.errors, []);
+  assert.deepEqual(other.errors, []);
+});
+
+test('groups SQL migrations, filters them, and persists a manual migration category', async t => {
+  const sqlPaths = [
+    'backend/src/db/migrations/0101_currency_history.sql',
+    'backend/src/db/migrations/0101_currency_history.down.sql',
+  ];
+  const fixturePaths = ['README.md', 'src/schema.ts', ...sqlPaths];
+  const html = `
+    <a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter" title="4">4</span></a>
+    <main id="native-files">${filesHTML(fixturePaths)}</main>`;
+  const current = page(undefined, {}, html);
+  t.after(() => current.dom.window.close());
+  const shadow = await openPanel(current.window);
+  await until(() => links(shadow).length === fixturePaths.length, 'SQL fixture inventory');
+  const migrations = shadow.querySelector('details.group.migrations')!;
+  assert.deepEqual(paths(migrations), [...sqlPaths].sort());
+  assert.equal(migrations.querySelector('.group-count')?.textContent, '2');
+
+  const filter = [...shadow.querySelectorAll<HTMLButtonElement>('.filters button')]
+    .find(button => button.textContent === 'Migrations')!;
+  filter.click();
+  await until(() => links(shadow).length === sqlPaths.length, 'migration filter');
+  assert.deepEqual(paths(shadow), [...sqlPaths].sort());
+  assert.equal(shadow.querySelectorAll('details.group').length, 1);
+  filter.click();
+  await until(() => links(shadow).length === fixturePaths.length, 'all categories restored');
+
+  const correction = shadow.querySelector<HTMLSelectElement>('select[aria-label="Category for src/schema.ts"]')!;
+  correction.closest('details')!.open = true;
+  await until(() => !correction.disabled, 'migration correction preferences');
+  assert.equal(correction.querySelector('option[value="migrations"]')?.textContent, 'Migrations');
+  correction.value = 'migrations';
+  correction.dispatchEvent(new current.window.Event('change', { bubbles: true }));
+  await until(() => shadow.querySelector('details.group.migrations a[title="src/schema.ts"]'), 'manual migration correction');
+
+  const reload = page(undefined, current.stored, html);
+  t.after(() => reload.dom.window.close());
+  const reloaded = await openPanel(reload.window);
+  await until(() => reloaded.querySelector('details.group.migrations a[title="src/schema.ts"]'), 'migration correction on reload');
+  assert.deepEqual(paths(reloaded.querySelector('details.group.migrations')!), [...sqlPaths, 'src/schema.ts'].sort());
+  assert.deepEqual(current.errors, []);
+  assert.deepEqual(reload.errors, []);
+});
+
+test('subdivides implementation by area and backend module while retaining navigation and repository corrections', async t => {
+  const implementationPaths = [
+    'backend/src/api/v1/commission/sync.ts',
+    'backend/src/api/v1/payment/crud.ts',
+    'backend/src/db/schemas/sales-channels.ts',
+    'frontend/src/components/page.tsx',
+    'backend/scripts/proxy.cjs',
+    'frontend/src/types/reservation.ts',
+    'src/util.ts',
+  ];
+  const fixturePaths = [...implementationPaths, 'README.md', 'tests/client.test.ts', 'backend/src/db/migrations/0101_currency.sql'];
+  const html = `
+    <a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter" title="10">10</span></a>
+    <main id="native-files">${filesHTML(fixturePaths)}</main>`;
+  const current = page(undefined, {}, html);
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  const shadow = await openPanel(window);
+  await until(() => links(shadow).length === fixturePaths.length, 'implementation hierarchy inventory');
+  const implementation = shadow.querySelector<HTMLDetailsElement>('details.group.implementation')!;
+  const count = (details: Element) => details.firstElementChild?.querySelector('.group-count')?.textContent;
+  const subgroup = (group: string) => implementation.querySelector<HTMLDetailsElement>(`details.implementation-subgroup[data-group="${group}"]`);
+  assert.equal(count(implementation), '7');
+  assert.deepEqual(paths(implementation), [...implementationPaths].sort());
+  assert.equal(new Set(paths(shadow)).size, fixturePaths.length);
+  for (const [group, expected] of [
+    ['backend', implementationPaths.slice(0, 3)],
+    ['frontend', [implementationPaths[3]]],
+    ['scripts', [implementationPaths[4]]],
+    ['types', [implementationPaths[5]]],
+    ['other', [implementationPaths[6]]],
+  ] as const) {
+    assert.deepEqual(paths(subgroup(group)!), [...expected].sort());
+    assert.equal(count(subgroup(group)!), String(expected.length));
+  }
+  assert.deepEqual(paths(shadow.querySelector('details.group.documentation')!), ['README.md']);
+  assert.deepEqual(paths(shadow.querySelector('details.group.tests')!), ['tests/client.test.ts']);
+  assert.deepEqual(paths(shadow.querySelector('details.group.migrations')!), ['backend/src/db/migrations/0101_currency.sql']);
+
+  const commission = implementation.querySelector<HTMLDetailsElement>('details.implementation-module[data-module="api/v1/commission"]')!;
+  const payment = implementation.querySelector<HTMLDetailsElement>('details.implementation-module[data-module="api/v1/payment"]')!;
+  assert.ok(commission.firstElementChild?.textContent?.includes('API › v1 › Commission'));
+  assert.deepEqual(paths(commission), [implementationPaths[0]]);
+  assert.equal(count(commission), '1');
+  commission.open = false;
+  assert.equal(payment.open, true);
+  assert.equal(subgroup('backend')!.open, true);
+  commission.open = true;
+
+  const search = shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!;
+  const setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+  const setSearch = (value: string) => {
+    setValue.call(search, value);
+    search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  };
+  const filter = [...shadow.querySelectorAll<HTMLButtonElement>('.filters button')]
+    .find(button => button.textContent === 'Implementation')!;
+  filter.click();
+  setSearch('api/v1/commission');
+  await until(() => links(shadow).length === 1, 'module path search');
+  assert.equal(count(implementation), '1/7');
+  assert.equal(count(subgroup('backend')!), '1/3');
+  assert.equal(implementation.querySelectorAll('details.implementation-subgroup').length, 1);
+  assert.equal(implementation.querySelectorAll('details.implementation-module').length, 1);
+  const panel = shadow.querySelector('aside')!;
+  const groups = shadow.querySelector<HTMLElement>('.groups')!;
+  groups.scrollTop = 120;
+  const fileLink = links(shadow)[0];
+  fileLink.click();
+  await until(() => window.location.hash === `#${anchor(0)}`, 'module native diff navigation');
+  assert.strictEqual(shadow.querySelector('aside'), panel);
+  assert.strictEqual(shadow.querySelector('.groups'), groups);
+  assert.strictEqual(shadow.activeElement, fileLink);
+  assert.equal(groups.scrollTop, 120);
+  assert.equal(search.value, 'api/v1/commission');
+  assert.equal(filter.getAttribute('aria-pressed'), 'true');
+
+  setSearch('');
+  filter.click();
+  await until(() => links(shadow).length === fixturePaths.length, 'all files restored');
+  const movedPath = implementationPaths[3];
+  const correction = shadow.querySelector<HTMLSelectElement>(`select[aria-label="Subcategory for ${movedPath}"]`)!;
+  correction.closest('details')!.open = true;
+  await until(() => !correction.disabled, 'implementation correction preferences');
+  assert.deepEqual([...correction.options].map(option => option.value), ['auto', 'backend', 'frontend', 'scripts', 'types', 'other']);
+  correction.value = 'backend';
+  correction.dispatchEvent(new window.Event('change', { bubbles: true }));
+  await until(() => subgroup('backend')?.querySelector(`a[title="${movedPath}"]`), 'manual area correction');
+  assert.equal(subgroup('frontend'), null);
+  assert.equal(count(subgroup('backend')!), '4');
+  assert.equal(count(implementation), '7');
+  assert.equal(current.stored[`pr-reviewer:repo:acme/example:implementation:${movedPath}`], 'backend');
+  assert.deepEqual(paths(shadow), [...fixturePaths].sort());
+
+  const reload = page(undefined, current.stored, html);
+  t.after(() => reload.dom.window.close());
+  const reloaded = await openPanel(reload.window);
+  await until(() => reloaded.querySelector(`details.implementation-subgroup[data-group="backend"] a[title="${movedPath}"]`), 'saved area correction on reload');
+  const other = page('https://github.com/acme/other/pull/12/files', current.stored, html.replace('/acme/example/pull/12/files', '/acme/other/pull/12/files'));
+  t.after(() => other.dom.window.close());
+  const otherShadow = await openPanel(other.window);
+  await until(() => otherShadow.querySelector<HTMLSelectElement>(`select[aria-label="Subcategory for ${movedPath}"]`)?.disabled === false, 'other repository area preferences');
+  assert.ok(otherShadow.querySelector(`details.implementation-subgroup[data-group="frontend"] a[title="${movedPath}"]`));
+  for (const result of [current, reload, other]) assert.deepEqual(result.errors, []);
+});
+
+test('tracks GitHub SPA navigation without duplicating hosts or retaining stale PR files', async t => {
+  const current = page();
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  await openPanel(window);
+  const host = window.document.querySelector('#pr-reviewer-root')!;
+
+  window.history.pushState({}, '', '/acme/example/pull/13/files');
+  window.document.dispatchEvent(new window.Event('turbo:load', { bubbles: true }));
+  await until(() => host.shadowRoot?.querySelector('.launcher-count')?.textContent === '0', 'stale DOM inventory cleared');
+  const shadow = await openPanel(window);
+  assert.ok(shadow.textContent?.includes('#13'));
+  assert.deepEqual(paths(shadow), []);
+  window.document.querySelector('#native-files')!.innerHTML = filesHTML(['docs/next.md']);
+  window.document.querySelector<HTMLAnchorElement>('.tabnav-tab')!.href = '/acme/example/pull/13/files';
+  window.document.querySelector('#files_tab_counter')!.textContent = '1';
+  window.document.querySelector('#files_tab_counter')!.setAttribute('title', '1');
+  window.document.dispatchEvent(new window.Event('turbo:load', { bubbles: true }));
+  await until(() => links(shadow).length === 1 && paths(shadow)[0] === 'docs/next.md', 'new PR files');
+  assert.equal(window.document.querySelectorAll('#pr-reviewer-root').length, 1);
+  assert.strictEqual(window.document.querySelector('#pr-reviewer-root'), host);
+
+  window.history.pushState({}, '', '/acme/example/issues');
+  window.document.dispatchEvent(new window.Event('turbo:load', { bubbles: true }));
+  await until(() => !window.document.querySelector('#pr-reviewer-root'), 'host removed outside PR');
+
+  window.history.pushState({}, '', '/acme/example/pull/13/files');
+  window.document.dispatchEvent(new window.Event('turbo:load', { bubbles: true }));
+  const restored = await openPanel(window);
+  await until(() => links(restored).length === 1, 'host restored on PR entry');
+  assert.deepEqual(paths(restored), ['docs/next.md']);
+  assert.equal(window.document.querySelectorAll('#pr-reviewer-root').length, 1);
+  assert.deepEqual(current.errors, []);
+});
+
+test('organizes all 144 React tree files across virtual diff remounts and uses native tree navigation', async t => {
+  const allPaths = Array.from({ length: 144 }, (_, index) => {
+    const file = Math.floor(index / 3);
+    return index % 3 === 0 ? `docs/module-${file}.md` :
+      index % 3 === 1 ? `src/client-${file}.ts` : `tests/client-${file}.test.ts`;
+  });
+  const current = page('https://github.com/acme/example/pull/12/changes', {}, `
+    <a id="prs-files-anchor-tab" href="/acme/example/pull/12/changes">Files changed<span data-component="CounterLabel" aria-hidden="true">144</span></a>
+    <nav id="native-tree">${treeHTML(allPaths)}</nav>
+    <main id="native-files">${regionHTML(allPaths[0], 0)}</main>
+    <form id="native-review"><input type="checkbox" aria-label="Viewed" checked><textarea aria-label="Review comment"></textarea></form>`);
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  const document = window.document;
+  const native = document.querySelector('#native-files')!;
+  const tree = document.querySelector('#native-tree')!;
+  const treeContents = tree.innerHTML;
+  const draft = document.querySelector<HTMLTextAreaElement>('#native-review textarea')!;
+  const viewed = document.querySelector<HTMLInputElement>('#native-review input')!;
+  draft.value = 'Keep my pending review';
+
+  const shadow = await openPanel(window);
+  await until(() => links(shadow).length === allPaths.length, 'full virtualized PR inventory');
+  assert.equal(document.querySelectorAll('[role="region"][id^="diff-"]').length, 1);
+  assert.deepEqual(paths(shadow), [...allPaths].sort());
+  assert.equal(shadow.querySelector('.notice'), null);
+  for (const category of ['documentation', 'implementation', 'tests']) {
+    assert.equal(shadow.querySelector(`details.group.${category} .group-count`)?.textContent, '48');
+  }
+
+  native.innerHTML = regionHTML(allPaths[70], 70);
+  await new Promise(resolve => setTimeout(resolve, 250));
+  assert.deepEqual(paths(shadow), [...allPaths].sort());
+  assert.equal(shadow.querySelector('.launcher-count')?.textContent, '144');
+
+  const search = shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!;
+  const setValue = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!;
+  setValue.call(search, 'CLIENT');
+  search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  const filter = [...shadow.querySelectorAll<HTMLButtonElement>('.filters button')]
+    .find(button => button.textContent === 'Tests')!;
+  filter.click();
+  await until(() => links(shadow).length === 48, 'filtered test files');
+  const panel = shadow.querySelector('aside')!;
+  const groups = shadow.querySelector<HTMLElement>('.groups')!;
+  groups.scrollTop = 320;
+  const clickedIndexes: number[] = [];
+  for (const targetIndex of [143, 140]) {
+    const nativeLink = tree.querySelector<HTMLAnchorElement>(`a[href="#${anchor(targetIndex)}"]`)!;
+    nativeLink.addEventListener('click', event => {
+      event.preventDefault();
+      clickedIndexes.push(targetIndex);
+      native.innerHTML = regionHTML(allPaths[targetIndex], targetIndex);
+      window.history.replaceState({}, '', `#${anchor(targetIndex)}`);
+    });
+    assert.equal(document.getElementById(anchor(targetIndex)), null);
+    const panelLink = links(shadow).find(link => link.title === allPaths[targetIndex])!;
+    panelLink.click();
+    await until(() => panelLink.closest('li')!.classList.contains('selected'), 'native navigation marks selected file');
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.strictEqual(shadow.querySelector('aside'), panel);
+    assert.strictEqual(shadow.querySelector('.groups'), groups);
+    assert.strictEqual(shadow.activeElement, panelLink);
+    assert.strictEqual(shadow.querySelector('input[aria-label="Search files"]'), search);
+    assert.equal(search.value, 'CLIENT');
+    assert.equal(filter.getAttribute('aria-pressed'), 'true');
+    assert.equal(groups.scrollTop, 320);
+    assert.equal(links(shadow).length, 48);
+    assert.equal(shadow.querySelectorAll('li.selected').length, 1);
+    assert.ok(document.getElementById(anchor(targetIndex)));
+    assert.equal(window.location.hash, `#${anchor(targetIndex)}`);
+  }
+  assert.deepEqual(clickedIndexes, [143, 140]);
+  assert.strictEqual(document.querySelector('#native-review textarea'), draft);
+  assert.strictEqual(document.querySelector('#native-review input'), viewed);
+  assert.equal(draft.value, 'Keep my pending review');
+  assert.equal(viewed.checked, true);
+  assert.strictEqual(document.querySelector('#native-tree'), tree);
+  assert.equal(tree.innerHTML, treeContents);
+
+  assert.equal(shadow.querySelector('.launcher-count')?.textContent, '144');
+  assert.deepEqual(paths(shadow), allPaths.filter(path => path.startsWith('tests/')).sort());
+
+  window.history.pushState({}, '', '/acme/example/pull/13/changes');
+  document.dispatchEvent(new window.Event('turbo:load', { bubbles: true }));
+  await until(() => shadow.querySelector('.launcher-count')?.textContent === '0', 'old React tree rejected during SPA navigation');
+  assert.deepEqual(paths(shadow), []);
+  const nextPR = await openPanel(window);
+  tree.innerHTML = treeHTML(['docs/next.md']);
+  native.innerHTML = regionHTML('docs/next.md', 0);
+  document.querySelector<HTMLAnchorElement>('#prs-files-anchor-tab')!.href = '/acme/example/pull/13/changes';
+  document.querySelector('[data-component="CounterLabel"]')!.textContent = '1';
+  document.dispatchEvent(new window.Event('turbo:load', { bubbles: true }));
+  await until(() => links(nextPR).length === 1 && paths(nextPR)[0] === 'docs/next.md', 'new React PR inventory');
+  assert.deepEqual(current.errors, []);
+});
+
+test('organizes embedded summaries before native folders open and navigates through only async ancestors', async t => {
+  const targetPath = 'backend/src/api/v1/commission/sync.ts';
+  const fixturePaths = [targetPath, 'frontend/src/pages/home.tsx', 'README.md'];
+  const route = '/acme/example/pull/12/changes';
+  const payload = { payload: { pullRequestsChangesRoute: {
+    pullRequestUrl: 'https://github.com/acme/example/pull/12',
+    diffSummaries: fixturePaths.map((path, index) => ({ path, pathDigest: anchor(index).slice(5), changeType: 'ADDED' })),
+  } } };
+  const current = page(`https://github.com${route}`, {}, `
+    <a id="prs-files-anchor-tab" href="${route}">Files changed<span data-component="CounterLabel">3</span></a>
+    <react-app app-name="repo" initial-path="${route}"><script type="application/json" data-target="react-app.embeddedData">${JSON.stringify(payload)}</script></react-app>
+    <ul role="tree" aria-label="File Tree">
+      <li role="treeitem" id="backend" aria-expanded="false"><div class="PRIVATE_TreeView-item-toggle"></div></li>
+      <li role="treeitem" id="frontend" aria-expanded="false"><div class="PRIVATE_TreeView-item-toggle"></div></li>
+    </ul>
+    <main id="native-files">${regionHTML('README.md', 2)}</main>`);
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  const document = window.document;
+  const tree = document.querySelector('[role="tree"]')!;
+  const expanded: string[] = [];
+  let fileClicks = 0;
+  tree.addEventListener('click', event => {
+    const target = event.target as Element;
+    if (target.matches('a')) {
+      event.preventDefault();
+      fileClicks += 1;
+      document.querySelector('#native-files')!.innerHTML = regionHTML(targetPath, 0);
+      window.history.replaceState({}, '', `#${anchor(0)}`);
+    } else if (target.matches('.PRIVATE_TreeView-item-toggle')) {
+      const item = target.closest('[role="treeitem"]')!;
+      expanded.push(item.id);
+      window.setTimeout(() => {
+        item.setAttribute('aria-expanded', 'true');
+        const next = targetPath.split('/').slice(0, item.id.split('/').length + 1).join('/');
+        item.insertAdjacentHTML('beforeend', `<ul role="group"><li role="treeitem" id="${next}" ${next === targetPath ? 'tabindex="-1"' : 'aria-expanded="false"'}>${next === targetPath ? `<a href="#${anchor(0)}">sync.ts</a>` : '<div class="PRIVATE_TreeView-item-toggle"></div>'}</li></ul>`);
+      }, 0);
+    }
+  });
+
+  const shadow = await openPanel(window);
+  await until(() => links(shadow).length === fixturePaths.length, 'embedded inventory with collapsed native tree');
+  assert.deepEqual(paths(shadow), [...fixturePaths].sort());
+  const implementation = shadow.querySelector('details.group.implementation')!;
+  const module = implementation.querySelector('details.implementation-subgroup[data-group="backend"] details.implementation-module[data-module="api/v1/commission"]')!;
+  assert.ok(module.firstElementChild?.textContent?.includes('API › v1 › Commission'));
+  assert.deepEqual(paths(module), [targetPath]);
+  assert.equal(document.getElementById(targetPath), null);
+  assert.equal(document.getElementById('backend')!.getAttribute('aria-expanded'), 'false');
+  assert.deepEqual(expanded, []);
+
+  const search = shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!;
+  Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!.call(search, 'commission');
+  search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await until(() => links(shadow).length === 1, 'search before native ancestors load');
+  const panel = shadow.querySelector('aside')!;
+  const groups = shadow.querySelector<HTMLElement>('.groups')!;
+  groups.scrollTop = 110;
+  const link = links(shadow)[0];
+  link.click();
+  await until(() => link.closest('li')!.classList.contains('selected'), 'async native tree navigation completes');
+  await new Promise(resolve => setTimeout(resolve, 200));
+  assert.deepEqual(expanded, ['backend', 'backend/src', 'backend/src/api', 'backend/src/api/v1', 'backend/src/api/v1/commission']);
+  assert.equal(fileClicks, 1);
+  assert.equal(document.getElementById('frontend')!.getAttribute('aria-expanded'), 'false');
+  assert.equal(window.location.hash, `#${anchor(0)}`);
+  assert.strictEqual(shadow.querySelector('aside'), panel);
+  assert.strictEqual(shadow.querySelector('.groups'), groups);
+  assert.strictEqual(shadow.activeElement, link);
+  assert.equal(groups.scrollTop, 110);
+  assert.equal(search.value, 'commission');
+  assert.equal(shadow.querySelector('.launcher-count')?.textContent, '3');
+  assert.equal(implementation.firstElementChild?.querySelector('.group-count')?.textContent, '1/2');
+  assert.deepEqual(paths(shadow), [targetPath]);
+  assert.deepEqual(current.errors, []);
+});
+
+test('groups frontend modules and orders changed lines before unknown sizes, including live statistics updates', async t => {
+  const fixturePaths = [
+    'frontend/src/modules/reservations/unknown.tsx',
+    'frontend/src/modules/reservations/b-small.tsx',
+    'frontend/src/modules/reservations/zero.tsx',
+    'frontend/src/modules/reservations/z-large.tsx',
+    'frontend/src/modules/reservations/a-small.tsx',
+    'frontend/src/modules/settings/page.tsx',
+    'frontend/src/App.tsx',
+    'frontend/src/components/Widget.tsx',
+    'docs/a-small.md',
+    'docs/z-large.md',
+  ];
+  const statistics = [undefined, [2, 3], [0, 0], [40, 60], [5, 0], [100, 1], [200, 50], [250, 1], [1, 0], [250, 250]];
+  const summaries = fixturePaths.map((path, index) => ({
+    path, pathDigest: anchor(index).slice(5), changeType: 'MODIFIED',
+    ...(statistics[index] ? { linesAdded: statistics[index]![0], linesDeleted: statistics[index]![1] } : {}),
+  }));
+  const route = '/acme/example/pull/12/changes';
+  const payload = { payload: { pullRequestsChangesRoute: {
+    pullRequestUrl: 'https://github.com/acme/example/pull/12', diffSummaries: summaries,
+  } } };
+  const current = page(`https://github.com${route}`, {}, `
+    <a id="prs-files-anchor-tab" href="${route}">Files changed<span data-component="CounterLabel">10</span></a>
+    <react-app app-name="repo" initial-path="${route}"><script type="application/json" data-target="react-app.embeddedData">${JSON.stringify(payload)}</script></react-app>
+    <nav id="native-tree">${treeHTML(fixturePaths)}</nav>
+    <main id="native-files">${regionHTML('docs/z-large.md', 9)}</main>`);
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  const shadow = await openPanel(window);
+  await until(() => links(shadow).length === fixturePaths.length, 'frontend modules inventory');
+  const orderedPaths = (root: ParentNode) => links(root).map(link => link.title);
+  const count = (details: Element) => details.firstElementChild?.querySelector('.group-count')?.textContent;
+  const implementation = shadow.querySelector('details.group.implementation')!;
+  const frontend = implementation.querySelector('details.implementation-subgroup[data-group="frontend"]')!;
+  const reservations = frontend.querySelector('details.implementation-module[data-module="reservations"]')!;
+  const initialOrder = [3, 4, 1, 2, 0].map(index => fixturePaths[index]);
+  assert.deepEqual(orderedPaths(reservations), initialOrder);
+  assert.deepEqual([...frontend.querySelectorAll('details.implementation-module')].map(module => module.getAttribute('data-module')), ['', 'components', 'reservations', 'settings']);
+  assert.deepEqual(paths(frontend), fixturePaths.slice(0, 8).sort());
+  assert.equal(count(implementation), '8');
+  assert.equal(count(frontend), '8');
+  assert.equal(count(reservations), '5');
+  assert.deepEqual(orderedPaths(shadow.querySelector('details.group.documentation')!), [fixturePaths[9], fixturePaths[8]]);
+  assert.equal(new Set(paths(shadow)).size, fixturePaths.length);
+  assert.ok(shadow.querySelector('.sort-hint')?.textContent?.includes('Largest changes first'));
+  assert.equal(shadow.querySelector('.heat-legend')?.getAttribute('aria-label'), 'Change volume temperature');
+  for (const [index, heat] of [[0, null], [2, null], [8, 'cool'], [3, 'cool'], [5, 'mild'], [6, 'mild'], [7, 'warm'], [9, 'warm']] as const) {
+    const link = links(shadow).find(file => file.title === fixturePaths[index])!;
+    assert.equal(link.closest('li')!.getAttribute('data-heat'), heat, `heat boundary: ${statistics[index]?.reduce((sum, lines) => sum + lines, 0) ?? 'unknown'}`);
+    assert.equal(link.getAttribute('title'), fixturePaths[index]);
+    const total = link.querySelector('.change-total');
+    if (heat) {
+      const [added, deleted] = statistics[index]!;
+      assert.equal(link.querySelector('.file-changes')?.getAttribute('aria-label'), `${added} lines added and ${deleted} deleted, ${added + deleted} changes`);
+      assert.ok(total?.getAttribute('title'));
+    } else assert.equal(total?.getAttribute('title') ?? null, null);
+  }
+  const large = links(reservations).find(link => link.title === fixturePaths[3])!;
+  const changes = large.querySelector('.file-changes')!;
+  assert.ok(changes.textContent?.includes('+40'));
+  assert.ok(changes.textContent?.includes('−60'));
+  assert.ok(changes.getAttribute('aria-label'));
+
+  const search = shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!;
+  Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!.call(search, 'reservations');
+  search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  const filter = [...shadow.querySelectorAll<HTMLButtonElement>('.filters button')].find(button => button.textContent === 'Implementation')!;
+  filter.click();
+  await until(() => links(shadow).length === 5, 'ordered filtered frontend module');
+  assert.deepEqual(orderedPaths(reservations), initialOrder);
+  assert.equal(frontend.querySelectorAll('details.implementation-module').length, 1);
+  assert.equal(count(implementation), '5/8');
+  assert.equal(count(frontend), '5/8');
+  assert.equal(count(reservations), '5/5');
+  let nativeClicks = 0;
+  window.document.querySelector<HTMLAnchorElement>(`#native-tree a[href="#${anchor(3)}"]`)!.addEventListener('click', event => {
+    event.preventDefault();
+    nativeClicks += 1;
+    window.document.querySelector('#native-files')!.innerHTML = regionHTML(fixturePaths[3], 3);
+    window.history.replaceState({}, '', `#${anchor(3)}`);
+  });
+  const panel = shadow.querySelector('aside')!;
+  const groups = shadow.querySelector<HTMLElement>('.groups')!;
+  groups.scrollTop = 140;
+  large.click();
+  await until(() => large.closest('li')!.classList.contains('selected'), 'sorted file native navigation');
+  assert.equal(nativeClicks, 1);
+  assert.equal(window.location.hash, `#${anchor(3)}`);
+  assert.strictEqual(shadow.querySelector('aside'), panel);
+  assert.strictEqual(shadow.activeElement, large);
+  assert.equal(groups.scrollTop, 140);
+  assert.equal(search.value, 'reservations');
+  assert.equal(filter.getAttribute('aria-pressed'), 'true');
+
+  summaries[2].linesAdded = 200;
+  summaries[2].linesDeleted = 60;
+  window.document.querySelector('script[data-target="react-app.embeddedData"]')!.textContent = JSON.stringify(payload);
+  await until(() => links(reservations)[0]?.title === fixturePaths[2], 'updated statistics reorder unchanged inventory');
+  const updated = links(reservations)[0];
+  assert.equal(updated.closest('li')!.getAttribute('data-heat'), 'warm');
+  assert.equal(updated.querySelector('.change-total')?.getAttribute('title'), 'High: 251–500 changes');
+  assert.equal(updated.querySelector('.file-changes')?.getAttribute('aria-label'), '200 lines added and 60 deleted, 260 changes');
+  assert.deepEqual(orderedPaths(reservations), [2, 3, 4, 1, 0].map(index => fixturePaths[index]));
+  summaries[2].linesAdded = 441;
+  window.document.querySelector('script[data-target="react-app.embeddedData"]')!.textContent = JSON.stringify(payload);
+  await until(() => updated.closest('li')!.getAttribute('data-heat') === 'hot', 'live heat rises beyond 500 changed lines');
+  assert.equal(updated.querySelector('.change-total')?.getAttribute('title'), 'Very high: more than 500 changes');
+  assert.equal(updated.querySelector('.file-changes')?.getAttribute('aria-label'), '441 lines added and 60 deleted, 501 changes');
+  assert.deepEqual(orderedPaths(reservations), [2, 3, 4, 1, 0].map(index => fixturePaths[index]));
+  assert.equal(shadow.querySelector('.launcher-count')?.textContent, '10');
+  assert.equal(count(implementation), '5/8');
+  assert.equal(count(reservations), '5/5');
+  assert.equal(new Set(paths(shadow)).size, 5);
+  assert.strictEqual(shadow.querySelector('aside'), panel);
+  assert.equal(search.value, 'reservations');
+  assert.deepEqual(current.errors, []);
+});
+
+test('groups monorepo packages across implementation areas while preserving legacy modules and main categories', async t => {
+  const fixturePaths = [
+    'packages/mira-api/src/booking/service.ts', 'packages/mira-api/package.json',
+    'packages/mira-widgets/src/nested/BookingCard.tsx', 'packages/mira-widgets/src/other/util.ts', 'packages/mira-widgets/package.json',
+    'packages/mira-editor/src/model.ts', 'packages/mira-editor/package.json',
+    'packages/mira-widgets/scripts/build.ts', 'packages/mira-widgets/src/types/booking.ts', 'packages/mira-utils/src/helpers.ts',
+    'backend/src/api/v1/commission/sync.ts', 'frontend/src/pages/reservations/page.tsx',
+    'scripts/release.sh', 'src/types/local.ts', 'src/utils.ts',
+    'packages/mira-widgets/README.md', 'packages/mira-widgets/src/nested/Card.test.tsx', 'packages/mira-api/db/migrations/001.sql',
+  ];
+  const route = '/acme/example/pull/12/changes';
+  const payload = { payload: { pullRequestsChangesRoute: {
+    pullRequestUrl: 'https://github.com/acme/example/pull/12',
+    diffSummaries: fixturePaths.map((path, index) => ({
+      path, pathDigest: anchor(index).slice(5), changeType: 'MODIFIED',
+      linesAdded: index === 2 ? 5 : index === 3 ? 100 : index === 4 ? 20 : index + 1, linesDeleted: 0,
+    })),
+  } } };
+  const current = page(`https://github.com${route}`, {}, `
+    <a id="prs-files-anchor-tab" href="${route}">Files changed<span data-component="CounterLabel">18</span></a>
+    <react-app app-name="repo" initial-path="${route}"><script type="application/json" data-target="react-app.embeddedData">${JSON.stringify(payload)}</script></react-app>`);
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  const shadow = await openPanel(window);
+  await until(() => links(shadow).length === fixturePaths.length, 'mixed monorepo inventory');
+  const implementation = shadow.querySelector('details.group.implementation')!;
+  const count = (details: Element) => details.firstElementChild?.querySelector('.group-count')?.textContent;
+  const subgroup = (name: string) => implementation.querySelector(`details.implementation-subgroup[data-group="${name}"]`)!;
+  const module = (group: string, name: string) => subgroup(group).querySelector(`details.implementation-module[data-module="${name}"]`)!;
+  for (const [group, name, indices] of [
+    ['backend', 'mira-api', [0, 1]], ['frontend', 'mira-widgets', [2, 3, 4]], ['frontend', 'mira-editor', [5, 6]],
+    ['scripts', 'mira-widgets', [7]], ['types', 'mira-widgets', [8]], ['other', 'mira-utils', [9]],
+  ] as const) {
+    const packageModule = module(group, `packages/${name}`);
+    assert.deepEqual(paths(packageModule), indices.map(index => fixturePaths[index]).sort());
+    assert.equal(packageModule.firstElementChild?.firstElementChild?.textContent, name);
+    assert.equal(count(packageModule), String(indices.length));
+  }
+  assert.deepEqual(links(module('frontend', 'packages/mira-widgets')).map(link => link.title), [3, 4, 2].map(index => fixturePaths[index]));
+  assert.deepEqual(paths(module('backend', 'api/v1/commission')), [fixturePaths[10]]);
+  assert.deepEqual(paths(module('frontend', 'reservations')), [fixturePaths[11]]);
+  for (const [group, index] of [['scripts', 12], ['types', 13], ['other', 14]] as const) {
+    const legacyLink = links(subgroup(group)).find(link => link.title === fixturePaths[index])!;
+    assert.ok(legacyLink);
+    assert.strictEqual(legacyLink.closest('details.implementation-module'), module(group, ''));
+    assert.deepEqual(paths(module(group, '')), [fixturePaths[index]]);
+    assert.equal(module(group, '').firstElementChild?.firstElementChild?.textContent, 'General');
+  }
+  assert.equal(count(implementation), '15');
+  assert.equal(new Set(paths(shadow)).size, fixturePaths.length);
+  for (const [category, index] of [['documentation', 15], ['tests', 16], ['migrations', 17]] as const) {
+    assert.deepEqual(paths(shadow.querySelector(`details.group.${category}`)!), [fixturePaths[index]]);
+  }
+
+  const search = shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!;
+  Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!.call(search, 'packages/mira-widgets/');
+  search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await until(() => links(shadow).length === 7, 'exact package search across main categories');
+  assert.equal(count(implementation), '5/15');
+  assert.equal(count(subgroup('frontend')), '3/6');
+  assert.deepEqual(links(module('frontend', 'packages/mira-widgets')).map(link => link.title), [3, 4, 2].map(index => fixturePaths[index]));
+
+  const movedPath = fixturePaths[3];
+  const correction = shadow.querySelector<HTMLSelectElement>(`select[aria-label="Subcategory for ${movedPath}"]`)!;
+  correction.closest('details')!.open = true;
+  await until(() => !correction.disabled, 'package correction preferences');
+  correction.value = 'backend';
+  correction.dispatchEvent(new window.Event('change', { bubbles: true }));
+  await until(() => subgroup('backend')?.querySelector(`details.implementation-module[data-module="packages/mira-widgets"] a[title="${movedPath}"]`), 'manual area preserves package module');
+  assert.equal(module('backend', 'packages/mira-widgets').firstElementChild?.firstElementChild?.textContent, 'mira-widgets');
+  assert.deepEqual(paths(module('backend', 'packages/mira-widgets')), [movedPath]);
+  assert.deepEqual(paths(module('frontend', 'packages/mira-widgets')), [fixturePaths[2], fixturePaths[4]].sort());
+  assert.equal(count(implementation), '5/15');
+  assert.equal(links(shadow).length, 7);
+  assert.equal(new Set(paths(shadow)).size, 7);
+  assert.equal(current.stored[`pr-reviewer:repo:acme/example:implementation:${movedPath}`], 'backend');
+  assert.deepEqual(current.errors, []);
+});
+
+test('blocks legacy worker language statuses until a compatible Spanish status arrives', async t => {
+  const path = 'src/language.ts';
+  const warning = 'Reload PR Reviewer in chrome://extensions, then reload this GitHub tab to apply AI response language settings.';
+  let language: unknown;
+  const html = `
+    <a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">1</span></a>
+    <div class="js-file" data-tagsearch-path="${path}" id="${anchor(0)}">
+      <div class="file-header" data-path="${path}" data-anchor="${anchor(0)}"><a href="#${anchor(0)}" title="${path}">${path}</a></div>
+      <table><tbody><tr><td class="blob-num" data-line-number="1">1</td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">export const greeting = 'Hola';</span></td></tr></tbody></table>
+    </div>`;
+  const current = page(undefined, {}, html, message => {
+    if (message.type === 'ai-status') return {
+      ok: true,
+      status: { configured: true, enabled: true, model: 'legacy-fixture-model', ...(language === undefined ? {} : { language }) },
+    } as unknown as ExtensionResponse;
+    if (message.type === 'ai-review') return { ok: true, review: { summary: 'Resumen en español', highlights: [reviewComment('Añade un saludo')], focus: [reviewComment('Revisar el saludo')] } };
+  });
+  t.after(() => current.dom.window.close());
+  current.window.document.querySelector<HTMLAnchorElement>('.file-header a')!.addEventListener('click', event => {
+    event.preventDefault();
+    current.window.history.replaceState({}, '', `#${anchor(0)}`);
+  });
+  const shadow = await openPanel(current.window);
+  await until(() => links(shadow).length === 1, 'legacy worker file');
+  links(shadow)[0].click();
+  await until(() => shadow.querySelector<HTMLElement>('.ai-review')?.hidden === false && shadow.querySelector('.ai-error')?.textContent === warning, 'visible worker compatibility warning');
+  assert.equal(current.messages.some(message => message.type === 'ai-review'), false);
+  assert.equal(shadow.querySelector('.ai-result'), null);
+  shadow.querySelector<HTMLButtonElement>('button.ai-settings-button')!.click();
+  await until(() => current.messages.some(message => message.type === 'ai-open-settings'), 'settings remain available');
+
+  const previousStatuses = current.messages.filter(message => message.type === 'ai-status').length;
+  language = 'fr';
+  current.notifyAI();
+  await until(() => current.messages.filter(message => message.type === 'ai-status').length > previousStatuses, 'invalid worker language checked');
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(shadow.querySelector('.ai-error')?.textContent, warning);
+  assert.equal(current.messages.some(message => message.type === 'ai-review'), false);
+
+  language = 'es';
+  current.notifyAI();
+  await until(() => shadow.querySelector('.ai-summary')?.textContent === 'Resumen en español', 'compatible Spanish worker resumes review');
+  assert.equal(current.messages.filter(message => message.type === 'ai-review').length, 1);
+  assert.equal(shadow.querySelector('.ai-error'), null);
+  assert.ok(shadow.querySelector('.ai-scope')?.textContent?.includes('Español'));
+  assert.equal(shadow.querySelector('.ai-result')?.getAttribute('lang'), 'es');
+  assert.deepEqual(current.errors, []);
+});
+
+test('reviews only the selected diff through the background bridge and ignores a late previous review', async t => {
+  const fixturePaths = ['src/alpha.ts', 'src/beta.ts'];
+  const secret = 'TEST_KEY_NOT_FOR_PAGE';
+  let responseLanguage: AILanguage = 'en';
+  const pending = new Map<string, { requestId: string; resolve: (response: ExtensionResponse) => void }>();
+  const html = `
+    <a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">2</span></a>
+    <main id="native-files">${fixturePaths.map((path, index) => `
+      <div class="js-file" data-tagsearch-path="${path}" id="${anchor(index)}">
+        <div class="file-header" data-path="${path}" data-anchor="${anchor(index)}"><a href="#${anchor(index)}" title="${path}">${path}</a></div>
+        <table><tbody><tr><td class="blob-num" data-line-number="1">1</td><td class="blob-code blob-code-deletion"><span class="blob-code-inner" data-code-marker="-">export const ${index ? 'beta' : 'alpha'} = 0;</span></td></tr><tr><td class="blob-num" data-line-number="1">1</td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">export const ${index ? 'beta' : 'alpha'} = ${index + 1};</span></td></tr></tbody></table>
+      </div>`).join('')}</main>
+    <textarea aria-label="Review comment">PRIVATE_REVIEW_DRAFT</textarea><input type="checkbox" aria-label="Viewed" checked>`;
+  const current = page(undefined, { 'private-ai-settings': { apiKey: secret } }, html, message => {
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture-model', language: responseLanguage } };
+    if (message.type === 'ai-review') return new Promise(resolve => pending.set(message.context.path, { requestId: message.requestId, resolve }));
+  });
+  t.after(() => current.dom.window.close());
+  const native = current.window.document.querySelector('#native-files')!;
+  const nativeHTML = native.innerHTML;
+  const draft = current.window.document.querySelector('textarea')!;
+  const viewed = current.window.document.querySelector<HTMLInputElement>('input[aria-label="Viewed"]')!;
+  // jsdom defers an anchor's default navigation; GitHub's native navigation
+  // updates the route when clicked, so an old navigation cannot reselect a file.
+  for (const link of current.window.document.querySelectorAll<HTMLAnchorElement>('.file-header a')) {
+    link.addEventListener('click', event => {
+      event.preventDefault();
+      current.window.history.replaceState({}, '', link.getAttribute('href')!);
+    });
+  }
+  const shadow = await openPanel(current.window);
+  await until(() => links(shadow).length === 2, 'AI fixture files');
+  const panel = shadow.querySelector('aside')!;
+  links(shadow).find(link => link.title === fixturePaths[0])!.click();
+  const alpha = await until(() => pending.get(fixturePaths[0]), 'first file review request');
+  const alphaRequest = current.messages.find(message => message.type === 'ai-review' && message.context.path === fixturePaths[0]);
+  assert.ok(alphaRequest?.type === 'ai-review');
+  assert.ok(alphaRequest.context.diff.includes('export const alpha = 1;'));
+  assert.ok(alphaRequest.context.diff.includes('[old line 1] -export const alpha = 0;'));
+  assert.ok(alphaRequest.context.diff.includes('[new line 1] +export const alpha = 1;'));
+  assert.equal(alphaRequest.context.diff.includes('export const beta'), false);
+  assert.equal(shadow.querySelector<HTMLElement>('.ai-review')?.hidden, false);
+  assert.ok(shadow.querySelector('.ai-loading')?.textContent?.includes('Generating review'));
+  const filesView = [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Files')!;
+  filesView.click();
+  links(shadow).find(link => link.title === fixturePaths[1])!.click();
+  const beta = await until(() => pending.get(fixturePaths[1]), 'second file review request');
+  assert.ok(current.messages.some(message => message.type === 'ai-cancel' && message.requestId === alpha.requestId));
+  beta.resolve({ ok: true, review: {
+    summary: 'Current beta summary',
+    highlights: [reviewComment('Beta highlight'), { text: 'Beta old value changed', lines: [{ side: 'left', line: 1 }, { side: 'right', line: 1 }] }],
+    focus: [reviewComment('Check beta callers', 'left'), { text: 'Check default behavior', lines: [] }],
+  } });
+  await until(() => shadow.querySelector('.ai-summary')?.textContent === 'Current beta summary', 'current file review result');
+  alpha.resolve({ ok: true, review: { summary: 'Stale alpha summary', highlights: [reviewComment('Stale alpha highlight')], focus: [reviewComment('Stale alpha focus')] } });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(shadow.querySelector('.ai-summary')?.textContent, 'Current beta summary');
+  assert.equal(shadow.querySelector('.ai-result')?.getAttribute('lang'), 'en');
+  assert.ok(shadow.querySelector('.ai-scope')?.textContent?.includes('English'));
+  assert.equal(shadow.querySelector('.ai-file')?.getAttribute('title'), fixturePaths[1]);
+  assert.ok(shadow.querySelector('.ai-result')?.textContent?.includes('Beta highlight'));
+  assert.ok(shadow.querySelector('.ai-result')?.textContent?.includes('Check beta callers'));
+  assert.ok(shadow.querySelector('.ai-summary-card .ai-summary'));
+  const highlights = [...shadow.querySelectorAll('.ai-highlights li.ai-comment')];
+  const focus = [...shadow.querySelectorAll('.ai-focus li.ai-comment')];
+  assert.equal(highlights.length, 2);
+  assert.equal(focus.length, 2);
+  for (const [point, text, references] of [
+    [highlights[0], 'Beta highlight', [['right', 'New L1']]],
+    [highlights[1], 'Beta old value changed', [['left', 'Old L1'], ['right', 'New L1']]],
+    [focus[0], 'Check beta callers', [['left', 'Old L1']]],
+    [focus[1], 'Check default behavior', []],
+  ] as const) {
+    assert.equal(point.querySelector('.ai-comment-text')?.textContent, text);
+    const row = point.querySelector('.ai-line-references')!;
+    assert.ok(row);
+    const chips = [...row.querySelectorAll<HTMLElement>('.ai-line-chip')];
+    assert.deepEqual(chips.map(chip => [chip.dataset.side, chip.textContent]), references);
+    for (const chip of chips) {
+      assert.strictEqual(chip.parentElement, row);
+      assert.ok(chip.getAttribute('title'));
+      assert.ok(chip.getAttribute('aria-label')?.includes('1'));
+    }
+    if (!references.length) assert.equal(row.querySelector('.ai-line-unavailable')?.textContent, 'Line reference unavailable');
+  }
+  assert.equal(shadow.querySelector('.ai-result')?.textContent?.includes('Stale alpha'), false);
+  assert.strictEqual(shadow.querySelector('aside'), panel);
+  assert.equal(current.window.document.querySelector('textarea')!.value, 'PRIVATE_REVIEW_DRAFT');
+  assert.equal(current.window.document.querySelector<HTMLInputElement>('input[aria-label="Viewed"]')!.checked, true);
+  assert.equal(JSON.stringify(current.messages).includes(secret), false);
+  assert.equal(JSON.stringify(current.messages).includes('PRIVATE_REVIEW_DRAFT'), false);
+  assert.equal(shadow.textContent?.includes(secret), false);
+  assert.strictEqual(current.window.document.querySelector('#native-files'), native);
+  assert.equal(native.innerHTML, nativeHTML);
+  assert.strictEqual(current.window.document.querySelector('textarea'), draft);
+  assert.strictEqual(current.window.document.querySelector('input[aria-label="Viewed"]'), viewed);
+
+  filesView.click();
+  current.window.dispatchEvent(new current.window.Event('focus'));
+  current.window.document.dispatchEvent(new current.window.Event('visibilitychange'));
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(filesView.getAttribute('aria-pressed'), 'true');
+  assert.equal(shadow.querySelector<HTMLElement>('.ai-review')?.hidden, true);
+  assert.equal(current.messages.filter(message => message.type === 'ai-review' && message.context.path === fixturePaths[1]).length, 1);
+  links(shadow).find(link => link.title === fixturePaths[1])!.click();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(current.messages.filter(message => message.type === 'ai-review' && message.context.path === fixturePaths[1]).length, 1);
+  shadow.querySelector<HTMLButtonElement>('button.ai-retry')!.click();
+  const refreshingEnglish = await until(() => {
+    const request = pending.get(fixturePaths[1]);
+    return request?.requestId !== beta.requestId ? request : null;
+  }, 'English review refresh request');
+  responseLanguage = 'es';
+  current.notifyAI();
+  const spanish = await until(() => {
+    const request = pending.get(fixturePaths[1]);
+    return request?.requestId !== refreshingEnglish.requestId ? request : null;
+  }, 'language change review request');
+  assert.ok(current.messages.some(message => message.type === 'ai-cancel' && message.requestId === refreshingEnglish.requestId));
+  assert.equal(shadow.querySelector('.ai-result'), null);
+  refreshingEnglish.resolve({ ok: true, review: { summary: 'Stale English refresh', highlights: [reviewComment('Stale English highlight')], focus: [reviewComment('Stale English focus')] } });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(shadow.querySelector('.ai-result'), null);
+  spanish.resolve({ ok: true, review: { summary: 'Resumen actual en español', highlights: [reviewComment('Cambio de beta')], focus: [reviewComment('Revisar los consumidores de beta', 'left')] } });
+  await until(() => shadow.querySelector('.ai-summary')?.textContent === 'Resumen actual en español', 'Spanish review result');
+  assert.equal(shadow.querySelector('.ai-result')?.getAttribute('lang'), 'es');
+  assert.ok(shadow.querySelector('.ai-scope')?.textContent?.includes('Español'));
+  assert.equal(shadow.querySelector('.ai-review h2')?.textContent, 'AI review');
+  assert.deepEqual([...shadow.querySelectorAll('.ai-highlights h3, .ai-focus h3')].map(heading => heading.textContent), ['Highlights', 'Review focus']);
+  assert.equal(shadow.querySelector('.ai-result')?.textContent?.includes('Stale English'), false);
+  assert.equal(JSON.stringify(current.messages).includes(secret), false);
+  assert.equal(JSON.stringify(current.messages).includes('PRIVATE_REVIEW_DRAFT'), false);
+  assert.equal(native.innerHTML, nativeHTML);
+  assert.equal(draft.value, 'PRIVATE_REVIEW_DRAFT');
+  assert.equal(viewed.checked, true);
+  assert.deepEqual(current.errors, []);
+});
