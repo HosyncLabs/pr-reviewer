@@ -6,6 +6,19 @@ import { isAISettingsChange, loadAISettings, loadPreferencesTrusted, saveImpleme
 const active = new Map<number, { requestId: string; controller: AbortController }>();
 const cache = new Map<string, { at: number; review: AIReviewResult }>();
 const REVIEW_FORMAT = 'line-comments-v1';
+const commentSchema = {
+  type: 'array', maxItems: 5, items: {
+    type: 'object', additionalProperties: false, required: ['text', 'lines'], properties: {
+      text: { type: 'string' },
+      lines: { type: 'array', maxItems: 3, items: {
+        type: 'object', additionalProperties: false, required: ['side', 'line'], properties: {
+          side: { type: 'string', enum: ['left', 'right'] },
+          line: { type: 'integer', minimum: 1 },
+        },
+      } },
+    },
+  },
+};
 const error = (message: string): ExtensionResponse => ({ ok: false, error: message });
 const validPath = (path: unknown): path is string => typeof path === 'string' && !!path.trim() && path.length <= 2048 && !path.includes('\0');
 const validRequestId = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 128;
@@ -95,19 +108,7 @@ async function reviewFile(context: AIReviewContext, requestId: string, sender: c
           type: 'json_schema', name: 'file_review_line_comments_v1', strict: true,
           schema: { type: 'object', additionalProperties: false, properties: {
             summary: { type: 'string' },
-            ...Object.fromEntries(['highlights', 'focus'].map(name => [name, {
-              type: 'array', maxItems: 5, items: {
-                type: 'object', additionalProperties: false, required: ['text', 'lines'], properties: {
-                  text: { type: 'string' },
-                  lines: { type: 'array', maxItems: 3, items: {
-                    type: 'object', additionalProperties: false, required: ['side', 'line'], properties: {
-                      side: { type: 'string', enum: ['left', 'right'] },
-                      line: { type: 'integer', minimum: 1 },
-                    },
-                  } },
-                },
-              },
-            }])),
+            highlights: commentSchema, focus: commentSchema,
           }, required: ['summary', 'highlights', 'focus'] },
         } },
       }),

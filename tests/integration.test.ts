@@ -97,8 +97,8 @@ function page(url = 'https://github.com/acme/example/pull/12/files', stored: Sto
   return { dom, window, stored, errors, messages, notifyAI: () => notify(AI_STATUS_NOTICE, {}) };
 }
 
-async function until<T>(read: () => T | null | undefined | false, description: string): Promise<T> {
-  const deadline = Date.now() + 4_000;
+async function until<T>(read: () => T | null | undefined | false, description: string, timeout = 4_000): Promise<T> {
+  const deadline = Date.now() + timeout;
   while (Date.now() < deadline) {
     const value = read();
     if (value) return value;
@@ -832,10 +832,12 @@ test('groups monorepo packages across implementation areas while preserving lega
   assert.deepEqual(current.errors, []);
 });
 
-test('blocks legacy worker language statuses until a compatible Spanish status arrives', async t => {
+test('rejects legacy worker language and review schemas until a compatible Spanish review arrives', async t => {
   const path = 'src/language.ts';
   const warning = 'Reload PR Reviewer in chrome://extensions, then reload this GitHub tab to apply AI response language settings.';
+  const referenceWarning = 'Reload PR Reviewer in chrome://extensions, then reload this GitHub tab to apply AI line references.';
   let language: unknown;
+  let structured = false;
   const html = `
     <a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">1</span></a>
     <div class="js-file" data-tagsearch-path="${path}" id="${anchor(0)}">
@@ -847,7 +849,10 @@ test('blocks legacy worker language statuses until a compatible Spanish status a
       ok: true,
       status: { configured: true, enabled: true, model: 'legacy-fixture-model', ...(language === undefined ? {} : { language }) },
     } as unknown as ExtensionResponse;
-    if (message.type === 'ai-review') return { ok: true, review: { summary: 'Resumen en español', highlights: [reviewComment('Añade un saludo')], focus: [reviewComment('Revisar el saludo')] } };
+    if (message.type === 'ai-review') {
+      if (!structured) return { ok: true, review: { summary: 'Old string-array review', highlights: ['Old highlight'], focus: ['Old focus'] } } as unknown as ExtensionResponse;
+      return { ok: true, review: { summary: 'Resumen en español', highlights: [reviewComment('Añade un saludo')], focus: [reviewComment('Revisar el saludo')] } };
+    }
   });
   t.after(() => current.dom.window.close());
   current.window.document.querySelector<HTMLAnchorElement>('.file-header a')!.addEventListener('click', event => {
@@ -873,8 +878,13 @@ test('blocks legacy worker language statuses until a compatible Spanish status a
 
   language = 'es';
   current.notifyAI();
-  await until(() => shadow.querySelector('.ai-summary')?.textContent === 'Resumen en español', 'compatible Spanish worker resumes review');
+  await until(() => shadow.querySelector('.ai-error')?.textContent === referenceWarning, 'valid language with legacy review schema rejected');
   assert.equal(current.messages.filter(message => message.type === 'ai-review').length, 1);
+  assert.equal(shadow.querySelector('.ai-result'), null);
+  structured = true;
+  shadow.querySelector<HTMLButtonElement>('button.ai-retry')!.click();
+  await until(() => shadow.querySelector('.ai-summary')?.textContent === 'Resumen en español', 'compatible Spanish worker resumes review');
+  assert.equal(current.messages.filter(message => message.type === 'ai-review').length, 2);
   assert.equal(shadow.querySelector('.ai-error'), null);
   assert.ok(shadow.querySelector('.ai-scope')?.textContent?.includes('Español'));
   assert.equal(shadow.querySelector('.ai-result')?.getAttribute('lang'), 'es');
@@ -885,18 +895,21 @@ test('reviews only the selected diff through the background bridge and ignores a
   const fixturePaths = ['src/alpha.ts', 'src/beta.ts'];
   const secret = 'TEST_KEY_NOT_FOR_PAGE';
   let responseLanguage: AILanguage = 'en';
+  const scrolled: Element[] = [];
   const pending = new Map<string, { requestId: string; resolve: (response: ExtensionResponse) => void }>();
   const html = `
     <a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">2</span></a>
     <main id="native-files">${fixturePaths.map((path, index) => `
       <div class="js-file" data-tagsearch-path="${path}" id="${anchor(index)}">
         <div class="file-header" data-path="${path}" data-anchor="${anchor(index)}"><a href="#${anchor(index)}" title="${path}">${path}</a></div>
-        <table><tbody><tr><td class="blob-num" data-line-number="1">1</td><td class="blob-code blob-code-deletion"><span class="blob-code-inner" data-code-marker="-">export const ${index ? 'beta' : 'alpha'} = 0;</span></td></tr><tr><td class="blob-num" data-line-number="1">1</td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">export const ${index ? 'beta' : 'alpha'} = ${index + 1};</span></td></tr></tbody></table>
+        <table><tbody><tr><td class="blob-num" data-line-number="1" id="${anchor(index)}L1">1</td><td class="blob-code blob-code-deletion"><span class="blob-code-inner" data-code-marker="-">export const ${index ? 'beta' : 'alpha'} = 0;</span></td></tr><tr><td class="blob-num" data-line-number="1" id="${anchor(index)}R1">1</td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">export const ${index ? 'beta' : 'alpha'} = ${index + 1};</span></td></tr><tr><td class="blob-num" data-line-number="2" id="${anchor(index)}R2">2</td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">export const ${index ? 'beta' : 'alpha'}Enabled = true;</span></td></tr></tbody></table>
       </div>`).join('')}</main>
     <textarea aria-label="Review comment">PRIVATE_REVIEW_DRAFT</textarea><input type="checkbox" aria-label="Viewed" checked>`;
   const current = page(undefined, { 'private-ai-settings': { apiKey: secret } }, html, message => {
     if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture-model', language: responseLanguage } };
     if (message.type === 'ai-review') return new Promise(resolve => pending.set(message.context.path, { requestId: message.requestId, resolve }));
+  }, window => {
+    window.HTMLElement.prototype.scrollIntoView = function () { scrolled.push(this); };
   });
   t.after(() => current.dom.window.close());
   const native = current.window.document.querySelector('#native-files')!;
@@ -913,6 +926,10 @@ test('reviews only the selected diff through the background bridge and ignores a
   }
   const shadow = await openPanel(current.window);
   await until(() => links(shadow).length === 2, 'AI fixture files');
+  // jsdom's selector engine reenters :focus-within and clears its cache when
+  // focusing a shadow input after delayed navigation; visual focus styling is browser-tested.
+  const style = shadow.querySelector('style')!;
+  style.textContent = style.textContent!.replaceAll(':focus-within', ':focus');
   const panel = shadow.querySelector('aside')!;
   links(shadow).find(link => link.title === fixturePaths[0])!.click();
   const alpha = await until(() => pending.get(fixturePaths[0]), 'first file review request');
@@ -931,7 +948,7 @@ test('reviews only the selected diff through the background bridge and ignores a
   assert.ok(current.messages.some(message => message.type === 'ai-cancel' && message.requestId === alpha.requestId));
   beta.resolve({ ok: true, review: {
     summary: 'Current beta summary',
-    highlights: [reviewComment('Beta highlight'), { text: 'Beta old value changed', lines: [{ side: 'left', line: 1 }, { side: 'right', line: 1 }] }],
+    highlights: [{ text: 'Beta highlight', lines: [{ side: 'right', line: 2 }] }, { text: 'Beta old value changed', lines: [{ side: 'left', line: 1 }, { side: 'right', line: 1 }] }],
     focus: [reviewComment('Check beta callers', 'left'), { text: 'Check default behavior', lines: [] }],
   } });
   await until(() => shadow.querySelector('.ai-summary')?.textContent === 'Current beta summary', 'current file review result');
@@ -949,7 +966,7 @@ test('reviews only the selected diff through the background bridge and ignores a
   assert.equal(highlights.length, 2);
   assert.equal(focus.length, 2);
   for (const [point, text, references] of [
-    [highlights[0], 'Beta highlight', [['right', 'New L1']]],
+    [highlights[0], 'Beta highlight', [['right', 'New L2']]],
     [highlights[1], 'Beta old value changed', [['left', 'Old L1'], ['right', 'New L1']]],
     [focus[0], 'Check beta callers', [['left', 'Old L1']]],
     [focus[1], 'Check default behavior', []],
@@ -957,15 +974,89 @@ test('reviews only the selected diff through the background bridge and ignores a
     assert.equal(point.querySelector('.ai-comment-text')?.textContent, text);
     const row = point.querySelector('.ai-line-references')!;
     assert.ok(row);
-    const chips = [...row.querySelectorAll<HTMLElement>('.ai-line-chip')];
+    const chips = [...row.querySelectorAll<HTMLAnchorElement>('a.ai-line-chip')];
     assert.deepEqual(chips.map(chip => [chip.dataset.side, chip.textContent]), references);
     for (const chip of chips) {
       assert.strictEqual(chip.parentElement, row);
-      assert.ok(chip.getAttribute('title'));
-      assert.ok(chip.getAttribute('aria-label')?.includes('1'));
+      const line = chip.textContent!.slice(-1);
+      const accessible = `${chip.dataset.side === 'left' ? 'Original' : 'New'} line ${line}`;
+      assert.equal(chip.getAttribute('title'), accessible);
+      assert.equal(chip.getAttribute('aria-label'), accessible);
+      assert.equal(chip.getAttribute('href'), `#${anchor(1)}${chip.dataset.side === 'left' ? 'L' : 'R'}${line}`);
     }
-    if (!references.length) assert.equal(row.querySelector('.ai-line-unavailable')?.textContent, 'Line reference unavailable');
+    const cardLink = point.querySelector<HTMLAnchorElement>('a.ai-comment-link');
+    if (references.length) assert.equal(cardLink?.getAttribute('href'), chips[0].getAttribute('href'), 'The whole-card link targets its first reference');
+    else {
+      assert.equal(row.querySelector('.ai-line-unavailable')?.textContent, 'Line reference unavailable');
+      assert.equal(cardLink, null);
+      assert.equal(point.querySelector('.ai-comment-text')?.tagName, 'P');
+    }
   }
+
+  const aiView = shadow.querySelector<HTMLElement>('.ai-review')!;
+  aiView.scrollTop = 123;
+  const requestsBeforeNavigation = current.messages.filter(message => message.type === 'ai-review').length;
+  const verifyNavigation = async (link: HTMLAnchorElement, side: 'L' | 'R', line: number) => {
+    const beforeScroll = scrolled.length;
+    link.click();
+    await until(() => current.window.location.hash === `#${anchor(1)}${side}${line}` && scrolled.length > beforeScroll, `AI reference navigation to ${side}${line}`);
+    const row = current.window.document.getElementById(`${anchor(1)}${side}${line}`)!.closest('tr')!;
+    assert.ok(scrolled.slice(beforeScroll).some(target => target === row || row.contains(target)), 'The referenced native code row is scrolled into view');
+    assert.strictEqual(shadow.querySelector('aside'), panel);
+    assert.equal(aiView.hidden, false);
+    assert.equal(aiView.scrollTop, 123);
+    assert.equal(shadow.querySelector('.ai-summary')?.textContent, 'Current beta summary');
+    assert.equal(draft.value, 'PRIVATE_REVIEW_DRAFT');
+    assert.equal(viewed.checked, true);
+  };
+  await verifyNavigation(highlights[0].querySelector<HTMLAnchorElement>('a.ai-comment-link')!, 'R', 2);
+  await verifyNavigation(highlights[1].querySelector<HTMLAnchorElement>('a.ai-comment-link')!, 'L', 1);
+  for (const chip of highlights[1].querySelectorAll<HTMLAnchorElement>('a.ai-line-chip')) {
+    await verifyNavigation(chip, chip.dataset.side === 'left' ? 'L' : 'R', 1);
+  }
+  const nativeModifiedClick = new current.window.MouseEvent('click', { bubbles: true, composed: true, cancelable: true, metaKey: true });
+  let modifiedDefaultPrevented: boolean | undefined;
+  current.window.document.addEventListener('click', event => {
+    modifiedDefaultPrevented = event.defaultPrevented;
+    // jsdom lacks modifier/new-tab routing; inspect the app before suppressing its default.
+    event.preventDefault();
+  }, { once: true });
+  highlights[1].querySelector<HTMLAnchorElement>('a.ai-line-chip[data-side="right"]')!.dispatchEvent(nativeModifiedClick);
+  assert.equal(modifiedDefaultPrevented, false, 'Modified clicks retain native anchor behavior');
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(current.messages.filter(message => message.type === 'ai-review').length, requestsBeforeNavigation, 'Line hashes and card/chip clicks do not regenerate the AI review');
+
+  const missingRow = current.window.document.getElementById(`${anchor(1)}R2`)!.closest('tr')!;
+  const tbody = missingRow.parentElement!;
+  missingRow.remove();
+  highlights[0].querySelector<HTMLAnchorElement>('a.ai-comment-link')!.click();
+  const navigationStatus = await until(() => {
+    const status = shadow.querySelector('.ai-navigation-status');
+    return status?.textContent === 'This line is not loaded. Load or expand its diff in GitHub, then try again.' ? status : null;
+  }, 'missing referenced line notice', 7_000);
+  assert.equal(navigationStatus.getAttribute('role'), 'status');
+  assert.equal(navigationStatus.getAttribute('lang'), 'en');
+  assert.equal(shadow.querySelector('.ai-summary')?.textContent, 'Current beta summary');
+  assert.equal(current.messages.filter(message => message.type === 'ai-review').length, requestsBeforeNavigation);
+  assert.equal(draft.value, 'PRIVATE_REVIEW_DRAFT');
+  assert.equal(viewed.checked, true);
+  tbody.append(missingRow);
+  await verifyNavigation(highlights[0].querySelector<HTMLAnchorElement>('a.ai-line-chip')!, 'R', 2);
+  await until(() => !shadow.querySelector('.ai-navigation-status'), 'successful retry clears line navigation notice');
+
+  missingRow.remove();
+  highlights[0].querySelector<HTMLAnchorElement>('a.ai-comment-link')!.click();
+  await until(() => shadow.querySelector('.ai-navigation-status')?.textContent === 'Finding referenced line…', 'pending navigation starts');
+  filesView.click();
+  await until(() => aiView.hidden && !shadow.querySelector('.ai-navigation-status'), 'Files view cancels pending line navigation');
+  const hashAfterCancel = current.window.location.hash;
+  tbody.append(missingRow);
+  await new Promise(resolve => setTimeout(resolve, 150));
+  assert.equal(current.window.location.hash, hashAfterCancel, 'A line loaded after cancellation does not trigger a delayed jump');
+  assert.equal(current.messages.filter(message => message.type === 'ai-review').length, requestsBeforeNavigation);
+  const aiViewButton = [...shadow.querySelectorAll<HTMLButtonElement>('.panel-views button')].find(button => button.textContent === 'AI review')!;
+  aiViewButton.click();
+  await until(() => !aiView.hidden, 'AI view remains available after canceled navigation');
   assert.equal(shadow.querySelector('.ai-result')?.textContent?.includes('Stale alpha'), false);
   assert.strictEqual(shadow.querySelector('aside'), panel);
   assert.equal(current.window.document.querySelector('textarea')!.value, 'PRIVATE_REVIEW_DRAFT');
@@ -1015,6 +1106,93 @@ test('reviews only the selected diff through the background bridge and ignores a
   assert.equal(JSON.stringify(current.messages).includes('PRIVATE_REVIEW_DRAFT'), false);
   assert.equal(native.innerHTML, nativeHTML);
   assert.equal(draft.value, 'PRIVATE_REVIEW_DRAFT');
+  assert.equal(viewed.checked, true);
+  assert.deepEqual(current.errors, []);
+});
+
+test('reviews semantic React diff gutters and navigates validated references on the correct side', async t => {
+  const originalChrome = Object.getOwnPropertyDescriptor(globalThis, 'chrome');
+  Object.defineProperty(globalThis, 'chrome', { configurable: true, value: {
+    runtime: { onMessage: { addListener() {} } },
+    storage: {
+      local: { setAccessLevel: async () => {} },
+      session: { setAccessLevel: async () => {} },
+      onChanged: { addListener() {} },
+    },
+  } });
+  t.after(() => {
+    if (originalChrome) Object.defineProperty(globalThis, 'chrome', originalChrome);
+    else Reflect.deleteProperty(globalThis, 'chrome');
+  });
+  const { parseAIReview } = await import('../src/background.ts');
+  const path = 'frontend/src/status.ts';
+  const route = '/acme/example/pull/12/changes';
+  const payload = { payload: { pullRequestsChangesRoute: {
+    pullRequestUrl: 'https://github.com/acme/example/pull/12',
+    diffSummaries: [{ path, pathDigest: anchor(0).slice(5), changeType: 'MODIFIED', linesAdded: 1, linesDeleted: 1 }],
+  } } };
+  const scrolled: Element[] = [];
+  const current = page(`https://github.com${route}`, {}, `
+    <a id="prs-files-anchor-tab" href="${route}">Files changed<span data-component="CounterLabel">1</span></a>
+    <react-app app-name="repo" initial-path="${route}"><script type="application/json" data-target="react-app.embeddedData">${JSON.stringify(payload)}</script></react-app>
+    <div role="region" aria-labelledby="semantic-heading" id="${anchor(0)}">
+      <h3 id="semantic-heading"><a href="#${anchor(0)}"><code>${path}</code></a></h3>
+      <table><thead><tr><th scope="col">Original file line number</th><th scope="col">Diff line number</th><th scope="col">Diff line change</th></tr></thead><tbody>
+        <tr><td>17</td><td></td><td>const previous = 0;</td></tr>
+        <tr><td></td><td>17</td><td>const current = 1;</td></tr>
+        <tr><td>18</td><td>19</td><td>export { current };</td></tr>
+      </tbody></table>
+    </div>
+    <textarea aria-label="Review comment">Retain semantic diff draft</textarea><input type="checkbox" aria-label="Viewed" checked>`, message => {
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture-model', language: 'en' } };
+    if (message.type === 'ai-review') {
+      const review = parseAIReview({ output_text: JSON.stringify({
+        summary: 'Updates the exported value.',
+        highlights: [{ text: 'Updates current.', lines: [{ side: 'right', line: 17 }, { side: 'left', line: 19 }, { side: 'right', line: 999 }] }],
+        focus: [{ text: 'Compare the previous value.', lines: [{ side: 'left', line: 17 }] }, { text: 'Check the exported value.', lines: [{ side: 'right', line: 19 }] }],
+      }) }, message.context.diff);
+      assert.ok(review);
+      return { ok: true, review };
+    }
+  }, window => {
+    window.HTMLElement.prototype.scrollIntoView = function () { scrolled.push(this); };
+  });
+  t.after(() => current.dom.window.close());
+  const native = current.window.document.getElementById(anchor(0))!;
+  const nativeHTML = native.innerHTML;
+  const rows = native.querySelectorAll('tbody tr');
+  const draft = current.window.document.querySelector('textarea')!;
+  const viewed = current.window.document.querySelector<HTMLInputElement>('input[aria-label="Viewed"]')!;
+  native.querySelector<HTMLAnchorElement>('h3 a')!.addEventListener('click', event => {
+    event.preventDefault();
+    current.window.history.replaceState({}, '', `#${anchor(0)}`);
+  });
+  const shadow = await openPanel(current.window);
+  const panel = shadow.querySelector('aside')!;
+  await until(() => links(shadow).length === 1, 'semantic React file inventory');
+  links(shadow)[0].click();
+  await until(() => shadow.querySelector('.ai-summary')?.textContent === 'Updates the exported value.', 'semantic gutter review result');
+  const request = current.messages.find(message => message.type === 'ai-review');
+  assert.ok(request?.type === 'ai-review');
+  assert.equal(request.context.diff, '[old line 17] -const previous = 0;\n[new line 17] +const current = 1;\n[new line 19]  export { current };');
+  assert.equal(request.context.partial, false);
+  assert.deepEqual([...shadow.querySelectorAll<HTMLAnchorElement>('a.ai-line-chip')].map(link => link.getAttribute('href')), [`#${anchor(0)}R17`, `#${anchor(0)}L17`, `#${anchor(0)}R19`], 'Only references validated against semantic gutter annotations are rendered');
+  for (const [selector, hash, gutter] of [
+    ['.ai-highlights a.ai-comment-link', `#${anchor(0)}R17`, rows[1].children[1]],
+    ['.ai-focus a.ai-line-chip[data-side="left"]', `#${anchor(0)}L17`, rows[0].children[0]],
+    ['.ai-focus a.ai-line-chip[data-side="right"]', `#${anchor(0)}R19`, rows[2].children[1]],
+  ] as const) {
+    const before = scrolled.length;
+    shadow.querySelector<HTMLAnchorElement>(selector)!.click();
+    await until(() => current.window.location.hash === hash && scrolled.length > before, `semantic gutter navigation ${hash}`);
+    assert.strictEqual(scrolled.at(-1), gutter);
+    assert.strictEqual(shadow.querySelector('aside'), panel);
+    assert.equal(shadow.querySelector<HTMLElement>('.ai-review')?.hidden, false);
+    assert.equal(shadow.querySelector('.ai-summary')?.textContent, 'Updates the exported value.');
+  }
+  assert.equal(current.messages.filter(message => message.type === 'ai-review').length, 1);
+  assert.equal(native.innerHTML, nativeHTML);
+  assert.equal(draft.value, 'Retain semantic diff draft');
   assert.equal(viewed.checked, true);
   assert.deepEqual(current.errors, []);
 });

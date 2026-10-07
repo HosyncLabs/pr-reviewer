@@ -1,6 +1,7 @@
 import type { Category, ImplementationGroup } from './classifier';
 import type { RepositoryPreferences } from './storage';
 
+export const CONTENT_VERSION = '0.1.3';
 export const DEFAULT_AI_MODEL = 'gpt-6-luna';
 export type AILanguage = 'en' | 'es';
 export const DEFAULT_AI_LANGUAGE: AILanguage = 'en';

@@ -1,4 +1,5 @@
 import { getPullRequest, isPullRequestView, readFiles, type PullRequestFile } from './github';
+import type { AIReviewLine } from './ai-protocol';
 
 export type ReviewContext = { path: string; diff: string; partial: boolean };
 
@@ -30,47 +31,189 @@ function renderedPath(target: Element, anchor: string): string | null {
   return link?.querySelector('code')?.textContent?.replace(/^[\t\n\r ]*\u200e|\u200e[\t\n\r ]*$/g, '') ?? null;
 }
 
-function lineNumber(cell: Element): string | null {
-  const own = cell.closest('[data-line-number]')?.getAttribute('data-line-number');
-  if (own && /^\d+$/.test(own)) return own;
-  const td = cell.closest('td');
-  for (let previous = td?.previousElementSibling; previous; previous = previous.previousElementSibling) {
-    const number = previous.getAttribute('data-line-number');
-    if (number && /^\d+$/.test(number)) return number;
-  }
-  const first = cell.closest('tr')?.querySelector('td')?.textContent?.trim();
-  return first && /^\d+$/.test(first) ? first : null;
+type LineSide = 'old' | 'new';
+type LineReference = { side: LineSide; line: number; target: Element };
+type CodeLine = { marker: string; reference: LineReference | null };
+
+function semanticTable(table: Element | null): number {
+  if (!table) return 0;
+  const headers = [...table.querySelectorAll('th, [role="columnheader"]')]
+    .filter(header => header.closest('table') === table);
+  if (headers.length !== 3 || !headers.every((header, index) =>
+    (header.tagName === 'TH' || header.tagName === 'TD') && (header as HTMLTableCellElement).rowSpan === 1 &&
+    header.parentElement === headers[0].parentElement && header.textContent?.trim() ===
+    ['Original file line number', 'Diff line number', 'Diff line change'][index])) return 0;
+  const spans = headers.map(header => (header as HTMLTableCellElement).colSpan);
+  return spans[0] === 1 && spans[1] === 1 && (spans[2] === 1 || spans[2] === 2) ? spans[2] : 0;
 }
 
-function extract(target: Element, file: PullRequestFile): ReviewContext | null {
-  let cells = [...target.querySelectorAll(CODE)].filter(cell => !cell.querySelector(CODE));
+function positiveLine(value: string | null): number | null {
+  if (!value || !/^\d+$/.test(value)) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : null;
+}
+
+function gutterInfo(element: Element, anchor: string): { side?: LineSide; line: number } | null {
+  const anchored = element.id.startsWith(anchor) ? element.id.slice(anchor.length).match(/^([LR])([1-9]\d*)$/) : null;
+  if (element.id.startsWith('diff-') && !anchored) return null;
+  const raw = element.getAttribute('data-line-number');
+  const line = positiveLine(raw) ?? positiveLine(anchored?.[2] ?? null);
+  if (line === null || anchored && raw !== null && positiveLine(raw) !== positiveLine(anchored[2])) return null;
+  const side = anchored ? anchored[1] === 'L' ? 'old' : 'new' :
+    element.matches('.js-blob-rnum, .blob-num-addition') ? 'new' :
+      element.matches('.blob-num-deletion') ? 'old' : undefined;
+  return { side, line };
+}
+
+function lineReference(cell: Element, marker: string, anchor: string): LineReference | null {
+  if (marker !== '+' && marker !== '-' && marker !== ' ') return null;
+  const column = cell.closest('td, [role="cell"], [role="gridcell"]');
+  const row = cell.closest('tr, [role="row"]');
+  const codeColumns = row ? [...row.children].filter(column => column.matches(CODE) || column.querySelector(CODE)) : [];
+  const splitSide: LineSide | undefined = codeColumns.length === 2 && column ?
+    codeColumns.indexOf(column) === 0 ? 'old' : codeColumns.indexOf(column) === 1 ? 'new' : undefined : undefined;
+  const gutters: Element[] = [];
+  for (let previous = column?.previousElementSibling; previous; previous = previous.previousElementSibling) {
+    if (codeColumns.includes(previous)) break;
+    if (previous.hasAttribute('data-line-number') || previous.matches('.blob-num')) gutters.unshift(previous);
+  }
+  const infos = gutters.map(gutter => gutterInfo(gutter, anchor));
+  const markedSide = marker === '+' ? 'new' : marker === '-' ? 'old' : undefined;
+  if (markedSide && splitSide && markedSide !== splitSide) return null;
+  const side = markedSide ?? splitSide ?? (gutters.length === 1 ? infos[0]?.side : undefined) ?? 'new';
+  const own = cell.closest('[data-line-number]');
+  if (own && own.id !== anchor && (!row || row.contains(own)) && (own !== row || codeColumns.length < 2)) {
+    const info = gutterInfo(own, anchor);
+    if (info && (!info.side || info.side === side)) return { side, line: info.line, target: own };
+  }
+  const knownIndex = infos.findIndex(info => info?.side === side);
+  if (knownIndex >= 0) return { side, line: infos[knownIndex]!.line, target: gutters[knownIndex] };
+  if (gutters.length === 1 && infos[0] && !infos[0].side) return { side, line: infos[0].line, target: gutters[0] };
+  return null;
+}
+
+function semanticLine(cell: Element, marker: string, anchor: string): CodeLine | undefined {
+  const row = cell.closest('tr');
+  const columns = row ? [...row.children] : [];
+  const codeSpan = semanticTable(row?.closest('table') ?? null);
+  if (!codeSpan || columns.length !== 3 || columns.some((column, index) => column.tagName !== 'TD' ||
+    (column as HTMLTableCellElement).colSpan !== (index === 2 ? codeSpan : 1) || (column as HTMLTableCellElement).rowSpan !== 1) ||
+    cell.closest('td') !== columns[2]) return;
+  const values = columns.slice(0, 2).map(gutter => gutter.textContent?.trim() ?? '');
+  // Classic gutters can expose numbers only through attributes; their normal adapter handles those.
+  if (values.every(value => !value)) return;
+  const numbers = values.map(positiveLine);
+  const invalid = (): CodeLine => ({ marker, reference: null });
+  if (values.some((value, index) => value && numbers[index] === null) ||
+    columns.slice(0, 2).some(gutter => !visible(gutter) || gutter.matches(EXCLUDED) || gutter.querySelector(EXCLUDED) ||
+      [...gutter.querySelectorAll('*')].some(element => element.textContent?.trim() &&
+        (!visible(element) || element.matches('[aria-hidden="true"], [role="tooltip"], tool-tip'))))) return invalid();
+  const inferred = numbers[0] === null ? '+' : numbers[1] === null ? '-' : ' ';
+  const side: LineSide = inferred === '-' ? 'old' : 'new';
+  const index = side === 'old' ? 0 : 1;
+  const explicit = cell.closest('[data-code-marker]')?.getAttribute('data-code-marker');
+  if (marker && marker !== inferred || explicit !== undefined && explicit !== null && explicit !== inferred) return invalid();
+  for (let index = 0; index < 2; index += 1) {
+    const gutter = columns[index];
+    const known = [gutter, ...gutter.querySelectorAll('[data-line-number], [id^="diff-"]')]
+      .filter(element => element.hasAttribute('data-line-number') || element.id.startsWith('diff-'));
+    for (const element of known) {
+      const info = gutterInfo(element, anchor);
+      if (!info || info.line !== numbers[index] || info.side && info.side !== (index === 0 ? 'old' : 'new')) return invalid();
+    }
+  }
+  const own = cell.closest('[data-line-number]');
+  if (own && own.id !== anchor && row?.contains(own)) {
+    const info = gutterInfo(own, anchor);
+    if (!info || info.line !== numbers[index] || info.side && info.side !== side) return invalid();
+  }
+  return { marker: inferred, reference: { side, line: numbers[index]!, target: columns[index] } };
+}
+
+function codeCells(target: Element): Element[] {
+  const sourceCell = (cell: Element) => !cell.closest(EXCLUDED) && !cell.closest('.empty-cell, .blob-code-hunk, .diff-hunk-cell') &&
+    !cell.querySelector('.blob-code-hunk, .diff-hunk-cell');
+  let cells = [...target.querySelectorAll(CODE)].filter(cell => !cell.querySelector(CODE) && sourceCell(cell));
   if (!cells.length) {
     // The local demo and simple native diff tables expose a numeric gutter.
     cells = [...target.querySelectorAll('table tr')].flatMap(row => {
       const columns = [...row.querySelectorAll(':scope > td')];
-      return columns.length >= 2 && /^\d+$/.test(columns[0].textContent?.trim() ?? '') ? [columns.at(-1)!] : [];
+      const semantic = columns.length === 3 && semanticTable(row.closest('table')) &&
+        columns.slice(0, 2).some(column => positiveLine(column.textContent?.trim() ?? '') !== null);
+      return (semantic || columns.length >= 2 && /^\d+$/.test(columns[0].textContent?.trim() ?? '')) &&
+        !columns.at(-1)!.querySelector(EXCLUDED) ? [columns.at(-1)!] : [];
     });
   }
+  return cells.filter(sourceCell);
+}
+
+function codeMarker(cell: Element): string {
+  const explicit = cell.closest('[data-code-marker]')?.getAttribute('data-code-marker');
+  return explicit === '+' || explicit === '-' || explicit === ' ' ? explicit :
+    cell.closest('.blob-code-addition') ? '+' : cell.closest('.blob-code-deletion') ? '-' :
+      cell.closest('.blob-code-context') ? ' ' : '';
+}
+
+function codeLine(cell: Element, anchor: string): CodeLine {
+  const marker = codeMarker(cell);
+  return semanticLine(cell, marker, anchor) ?? { marker, reference: lineReference(cell, marker, anchor) };
+}
+
+function selectedDiff(file: PullRequestFile, document: Document): { target: HTMLElement; current: PullRequestFile } | null {
+  const pr = getPullRequest(document.URL);
+  const current = readFiles(document).find(current => current.path === file.path && current.anchor === file.anchor);
+  if (!pr?.isFilesPage || !isPullRequestView(document, pr) || !current) throw new Error(STALE_ERROR);
+  const target = document.getElementById(file.anchor);
+  if (!target) return null;
+  const path = renderedPath(target, file.anchor);
+  if (path && path !== file.path) throw new Error(STALE_ERROR);
+  return path && visible(target) ? { target, current } : null;
+}
+
+export function findReviewLine(
+  file: PullRequestFile,
+  reference: AIReviewLine,
+  document: Document = globalThis.document,
+): HTMLElement | null {
+  if (!Number.isSafeInteger(reference.line) || reference.line < 1 ||
+    reference.side !== 'left' && reference.side !== 'right') return null;
+  try {
+    const selected = selectedDiff(file, document);
+    if (!selected) return null;
+    const side = reference.side === 'left' ? 'old' : 'new';
+    for (const cell of codeCells(selected.target)) {
+      if (!visible(cell)) continue;
+      const current = codeLine(cell, file.anchor).reference;
+      if (current?.side === side && current.line === reference.line) {
+        const target = visible(current.target) ? current.target : cell;
+        return target.namespaceURI === 'http://www.w3.org/1999/xhtml' ? target as HTMLElement : null;
+      }
+    }
+  } catch {
+    // Stale routes or mismatched file regions are never navigation targets.
+  }
+  return null;
+}
+
+function extract(target: Element, file: PullRequestFile): ReviewContext | null {
   const lines: string[] = [];
   let additions = 0;
   let deletions = 0;
   let length = 0;
   let partial = !!target.querySelector('.js-expand, .js-expand-all, .blob-num-expandable, .js-diff-load-container, [data-hidden-line-count]');
-  for (const cell of cells) {
-    if (cell.closest(EXCLUDED) || cell.matches('.blob-code-hunk') || cell.querySelector('.blob-code-hunk')) continue;
+  for (const cell of codeCells(target)) {
     if (!visible(cell)) { partial = true; continue; }
     const copy = cell.cloneNode(true) as Element;
     copy.querySelectorAll(EXCLUDED).forEach(element => element.remove());
     const text = (copy.textContent ?? '').replace(/\r\n?/g, '\n');
-    const explicitMarker = cell.closest('[data-code-marker]')?.getAttribute('data-code-marker');
-    const marker = explicitMarker === '+' || explicitMarker === '-' || explicitMarker === ' ' ? explicitMarker :
-      cell.closest('.blob-code-addition') ? '+' : cell.closest('.blob-code-deletion') ? '-' :
-        cell.closest('.blob-code-context') ? ' ' : '';
+    const { marker, reference } = codeLine(cell, file.anchor);
     if (marker === '+') additions += 1;
     if (marker === '-') deletions += 1;
-    if (!marker || text.includes('\n')) partial = true;
-    const number = lineNumber(cell);
-    const line = `${number ? `[line ${number}] ` : ''}${marker}${text}`;
+    if (!marker || /[\n\u2028\u2029]/.test(text)) partial = true;
+    if (!reference) partial = true;
+    // Keep each DOM row on one output row so source text cannot forge reference tags.
+    const source = text.replace(/\n/g, '\\n').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+    const line = `${reference ? `[${reference.side} line ${reference.line}] ` : ''}${marker || ' '}${source}`;
     length += line.length + (lines.length ? 1 : 0);
     lines.push(line);
     if (length > MAX_CHARS) { partial = true; break; }
@@ -100,16 +243,10 @@ export async function collectReviewContext(
     const check = () => {
       if (signal?.aborted) { abort(); return; }
       try {
-        const pr = getPullRequest(document.URL);
-        const current = readFiles(document).find(current => current.path === file.path && current.anchor === file.anchor);
-        if (document.URL.split('#')[0] !== route || !pr?.isFilesPage ||
-          !isPullRequestView(document, pr) || !current) throw new Error(STALE_ERROR);
-        const target = document.getElementById(file.anchor);
-        if (!target) return;
-        const path = renderedPath(target, file.anchor);
-        if (path && path !== file.path) throw new Error(STALE_ERROR);
-        if (!path || !visible(target)) return;
-        const context = extract(target, current);
+        if (document.URL.split('#')[0] !== route) throw new Error(STALE_ERROR);
+        const selected = selectedDiff(file, document);
+        if (!selected) return;
+        const context = extract(selected.target, selected.current);
         if (context) finish(context);
       } catch (error) { finish(undefined, error); }
     };

@@ -6,7 +6,7 @@ import {
 import { navigateToFile, type PullRequest, type PullRequestFile } from './github';
 import { loadPreferences, saveOverride, saveImplementationOverride, subscribePreferences, type RepositoryPreferences } from './storage';
 import { AiReview } from './AiReview';
-import type { AIStatus } from './ai-protocol';
+import { CONTENT_VERSION, type AIStatus } from './ai-protocol';
 
 export type Snapshot = { pr: PullRequest; files: PullRequestFile[]; expected: number | null; comparison: string };
 const symbols = { documentation: '▤', implementation: '〈〉', migrations: '▦', tests: '✓' };
@@ -174,7 +174,7 @@ export function Panel({ pr, files, expected, comparison }: Snapshot) {
     </button>
     {open && <aside id="pr-reviewer-panel" className="panel" aria-label="Pull request organizer">
       <header className="brand-bar">
-        <div className="brand"><span className="brand-mark" aria-hidden="true">▥</span> PR Reviewer <span className="local-badge">LOCAL</span></div>
+        <div className="brand"><span className="brand-mark" aria-hidden="true">▥</span> PR Reviewer <span className="local-badge" title={`Content UI version ${CONTENT_VERSION}`}>LOCAL · {CONTENT_VERSION}</span></div>
         <button className="ai-settings-button" hidden={view === 'ai'} onClick={() => {
           void chrome.runtime.sendMessage({ type: 'ai-open-settings' }).then(response => {
             if (!response?.ok) setError('Could not open AI settings. Reload the GitHub tab and try again.');

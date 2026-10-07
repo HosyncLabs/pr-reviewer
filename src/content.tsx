@@ -1,6 +1,7 @@
 import { createRoot, type Root } from 'react-dom/client';
 import { getPullRequest, readFiles, readExpectedCount, isPullRequestView } from './github';
 import { Panel, type Snapshot } from './Panel';
+import { CONTENT_VERSION } from './ai-protocol';
 import styles from './panel.css';
 
 const HOST_ID = 'pr-reviewer-root';
@@ -49,6 +50,7 @@ function mount() {
   // A repeated injection must never create a second panel or observer.
   if (document.getElementById(HOST_ID)) return;
   host = document.createElement('div'); host.id = HOST_ID;
+  host.dataset.contentVersion = CONTENT_VERSION;
   const shadow = host.attachShadow({ mode: 'open' });
   const style = document.createElement('style'); style.textContent = styles;
   const container = document.createElement('div');

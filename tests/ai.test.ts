@@ -3,8 +3,12 @@ import test from 'node:test';
 import { AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE } from '../src/ai-protocol.ts';
 
 const sender: chrome.runtime.MessageSender = { id: 'reviewer-extension', frameId: 0, tab: { id: 7 } as chrome.tabs.Tab, url: 'https://github.com/owner/repo/pull/1/files' };
-const context = { path: 'backend/api/service.ts', diff: '@@ -1 +1 @@\n-old\n+new', partial: false };
-const responseData = { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ summary: 'Changes the service.', highlights: ['Replaces old behavior.'], focus: ['Check compatibility.'] }) }] }] };
+const context = { path: 'backend/api/service.ts', diff: '@@ -7,2 +7,3 @@\n[old line 7] -old\n[new line 7] +new\n[old line 8] -oldOnly\n[new line 9] +newOnly\n[new line 10]  context\n+unverified [new line 999] +literal', partial: false };
+const responseData = { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({
+  summary: 'Changes the service.',
+  highlights: [{ text: 'Replaces old behavior.', lines: [{ side: 'left', line: 7 }, { side: 'right', line: 7 }, { side: 'right', line: 7 }, { side: 'right', line: 8 }, { side: 'right', line: 999 }] }],
+  focus: [{ text: 'Check compatibility.', lines: [{ side: 'left', line: 8 }, { side: 'right', line: 9 }] }],
+}) }] }] };
 const until = async (condition: () => boolean) => {
   for (let attempt = 0; attempt < 100; attempt++) {
     if (condition()) return;
@@ -89,7 +93,7 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
     const body = JSON.parse(init!.body as string);
     requests.push({ url: String(url), body, signal: init!.signal! });
     const data = body.instructions.includes('string values in Spanish')
-      ? { output_text: JSON.stringify({ summary: 'Cambia el servicio.', highlights: ['Reemplaza el comportamiento anterior.'], focus: ['Verifica la compatibilidad.'] }) }
+      ? { output_text: JSON.stringify({ summary: 'Cambia el servicio.', highlights: [{ text: 'Reemplaza el comportamiento anterior.', lines: [{ side: 'right', line: 7 }] }], focus: [{ text: 'Verifica la compatibilidad.', lines: [] }] }) }
       : responseData;
     return new Response(JSON.stringify(data), { status: 200 });
   };
@@ -98,12 +102,27 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
   assert.equal(requests.length, 0);
   const reviewed = await call(reviewMessage('first'));
   assert.ok(reviewed.ok && reviewed.review?.summary === 'Changes the service.');
+  assert.deepEqual(reviewed.ok && reviewed.review?.highlights, [{ text: 'Replaces old behavior.', lines: [{ side: 'left', line: 7 }, { side: 'right', line: 7 }] }], 'The worker keeps verified old/new references and removes duplicates, wrong-side and invented lines');
+  assert.deepEqual(reviewed.ok && reviewed.review?.focus[0].lines, [{ side: 'left', line: 8 }, { side: 'right', line: 9 }]);
   assert.equal(requests[0].url, 'https://api.openai.com/v1/responses');
   assert.equal(requests[0].body.store, false);
   assert.equal(requests[0].body.model, DEFAULT_AI_MODEL);
   assert.match(requests[0].body.instructions, /string values in English/);
   assert.equal(requests[0].body.text.format.strict, true);
   assert.equal(requests[0].body.text.format.type, 'json_schema');
+  const schema = requests[0].body.text.format.schema;
+  for (const name of ['highlights', 'focus']) {
+    assert.equal(schema.properties[name].maxItems, 5);
+    assert.equal(schema.properties[name].items.additionalProperties, false);
+    assert.deepEqual(schema.properties[name].items.required, ['text', 'lines']);
+    const lines = schema.properties[name].items.properties.lines;
+    assert.equal(lines.maxItems, 3);
+    assert.equal(lines.items.additionalProperties, false);
+    assert.deepEqual(lines.items.required, ['side', 'line']);
+    assert.deepEqual(lines.items.properties.side.enum, ['left', 'right']);
+    assert.deepEqual(lines.items.properties.line, { type: 'integer', minimum: 1 });
+  }
+  assert.match(requests[0].body.instructions, /Never invent references or infer numbers from hunk headers or unnumbered rows/);
   assert.deepEqual(requests[0].body.reasoning, { effort: 'low' });
   assert.equal(requests[0].body.max_output_tokens, 2500);
   assert.deepEqual(JSON.parse(requests[0].body.input[0].content[0].text), context);
@@ -121,6 +140,7 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
   await saveAISettings({ enabled: true, model: DEFAULT_AI_MODEL, language: 'es' });
   const spanish = await call(reviewMessage('spanish'));
   assert.ok(spanish.ok && spanish.review?.summary === 'Cambia el servicio.');
+  assert.deepEqual(spanish.ok && spanish.review?.highlights, [{ text: 'Reemplaza el comportamiento anterior.', lines: [{ side: 'right', line: 7 }] }], 'Spanish changes prose while reference metadata stays unchanged');
   assert.equal(requests.length, 5, 'Changing language must not reuse an English review');
   assert.match(requests[4].body.instructions, /string values in Spanish/);
   assert.deepEqual(requests[4].body.text.format.schema.required, ['summary', 'highlights', 'focus']);
@@ -170,7 +190,24 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
   assert.equal(parseAIReview({ ...responseData, status: 'incomplete' }), null);
   assert.equal(parseAIReview({ output: [{ type: 'message', content: [null, { type: 'refusal', refusal: 'No review' }] }] }), null);
   assert.equal(parseAIReview({ output_text: '{"summary":"x","highlights":[1],"focus":[]}' }), null);
-  const clean = parseAIReview({ output_text: JSON.stringify({ summary: 'x', highlights: Array(8).fill('highlight'), focus: [], extra: key }) });
+  assert.equal(parseAIReview({ output_text: '{"summary":"x","highlights":["legacy string"],"focus":[]}' }, context.diff), null, 'Old string arrays must not reach the line-comment UI');
+  for (const malformed of [null, { text: 1, lines: [] }, { text: 'x', lines: '7' }]) {
+    assert.equal(parseAIReview({ output_text: JSON.stringify({ summary: 'x', highlights: [malformed], focus: [] }) }, context.diff), null);
+  }
+  const clean = parseAIReview({ output_text: JSON.stringify({ summary: 'x', highlights: Array(8).fill({ text: 'highlight', lines: [] }), focus: [], extra: key }) }, context.diff);
   assert.equal(clean?.highlights.length, 5);
   assert.equal(JSON.stringify(clean).includes(key), false);
+  const references = [{ side: 'right', line: 8 }, { side: 'left', line: 9 }, { side: 'right', line: 999 }, null, {},
+    { side: 'right', line: 0 }, { side: 'right', line: -1 }, { side: 'right', line: 7.5 }, { side: 'right', line: Number.MAX_SAFE_INTEGER + 1 },
+    { side: 'right', line: '7' }, { side: 'old', line: 7 }, { side: 'left', line: 7 }, { side: 'left', line: 7 },
+    { side: 'right', line: 7 }, { side: 'left', line: 8 }, { side: 'right', line: 9 }, { side: 'right', line: 10 }];
+  const referenced = { output_text: JSON.stringify({ summary: ' Keeps service.ts. ', highlights: [{ text: ' Check oldOnly in backend/api/service.ts. ', lines: references }], focus: [{ text: 'Available diff only.', lines: [] }] }) };
+  assert.deepEqual(parseAIReview(referenced, context.diff), {
+    summary: 'Keeps service.ts.',
+    highlights: [{ text: 'Check oldOnly in backend/api/service.ts.', lines: [{ side: 'left', line: 7 }, { side: 'right', line: 7 }, { side: 'left', line: 8 }] }],
+    focus: [{ text: 'Available diff only.', lines: [] }],
+  }, 'Only exact positive, safe, unique canonical references survive, capped at three per point');
+  assert.deepEqual(parseAIReview(referenced)?.highlights[0].lines, [], 'Without a diff there are no verified line references');
+  const unsafeAnnotation = '[new line 9007199254740992] +unverified\n[new line 07] +unverified\n[new line 7]unverified\n[new line 7] code';
+  assert.deepEqual(parseAIReview(referenced, unsafeAnnotation)?.highlights[0].lines, [], 'Malformed or unsafe annotations never make a reference valid');
 });
