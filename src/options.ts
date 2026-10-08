@@ -1,5 +1,6 @@
 import { AI_LANGUAGE_LABELS, AI_PROVIDERS, isAILanguage, isAIProvider, sendExtensionMessage, type AIProvider } from './ai-protocol';
-import { loadAISettings, removeAIKey, saveAISettings, type AISettings } from './storage';
+import { loadAISettings, removeAIKey, saveAISettings, type AISettings, loadWorkflowTrusted } from './storage';
+import { WORKFLOW_KEY, DEFAULT_WORKFLOW, NUMBER_LIMITS, normalizeWorkflow, type WorkflowOptions } from './workflow';
 
 const form = document.querySelector<HTMLFormElement>('#settings')!;
 const provider = document.querySelector<HTMLSelectElement>('#provider')!;
@@ -15,6 +16,54 @@ const save = document.querySelector<HTMLButtonElement>('#save')!;
 const remove = document.querySelector<HTMLButtonElement>('#remove-key')!;
 let settings: AISettings;
 let configured = false;
+let workflow: Awaited<ReturnType<typeof loadWorkflowTrusted>>;
+const optionLabels: Record<string, [string, string]> = {
+  persistProgress: ['Save progress and notes', 'Remember reviewed/dismissed blocks, files, private notes, and your last file. Changed diffs reopen for review.'],
+  nextPending: ['Next pending navigation', 'Show a next pending button and completion counts per module.'],
+  syncViewed: ['Sync file completion with GitHub Viewed', 'When you mark a whole file reviewed or pending, update its native Viewed checkbox when available.'],
+  riskPriority: ['Prioritize sensitive paths', 'Access, money, database and deletion paths come first. These are path heuristics, separate from change volume.'],
+  findingDetails: ['Show finding type, severity and evidence', 'Distinguish possible bugs, questions, and suggestions.'],
+  suggestions: ['Enable Add suggestion', 'Open an editable GitHub suggestion for a verified single changed line.'],
+  checklist: ['Enable repository checklists', 'Track your criteria per file and include them in AI instructions.'],
+  automatic: ['Analyze automatically when opening files', 'Turn off to generate reviews only when you press Analyze file.'],
+  expandedContext: ['Use GitHub API diff and surrounding source', 'Opt in to sending more code to the selected AI provider, bounded by the limits below.'],
+  moduleReview: ['Enable module review', 'Show a manual Analyze module action and optional related-file selection across packages.'],
+  cacheReviews: ['Cache AI reviews locally', 'Reuse identical provider/model/language/context reviews across reloads. Refresh review bypasses the cache.'],
+};
+for (const [key, [label, hint]] of Object.entries(optionLabels)) {
+  const container = document.createElement('div');
+  const control = document.createElement('input'); control.type = 'checkbox'; control.id = `workflow-${key}`;
+  const heading = document.createElement('label'); heading.className = 'checkbox'; heading.append(control, document.createTextNode(label));
+  const help = document.createElement('p'); help.className = 'hint'; help.textContent = hint;
+  container.append(heading, help); document.querySelector('#workflow-options')!.append(container);
+}
+const limitLabels = { maxContextChars: 'Maximum context characters', maxOutputTokens: 'Maximum output tokens', dailyRequests: 'Daily AI requests (0 = unlimited, resets at UTC midnight)', moduleFileLimit: 'Maximum files per module analysis', contextLines: 'Surrounding lines per change (0 = diff only)' };
+for (const [key, [min, max]] of Object.entries(NUMBER_LIMITS)) {
+  const heading = document.createElement('label'); heading.htmlFor = `workflow-${key}`; heading.textContent = limitLabels[key as keyof typeof limitLabels];
+  const control = document.createElement('input'); control.type = 'number'; control.id = heading.htmlFor; control.min = String(min); control.max = String(max); control.required = true;
+  document.querySelector('#workflow-limits')!.append(heading, control);
+}
+const githubToken = document.querySelector<HTMLInputElement>('#github-token')!;
+const checklistRepo = document.querySelector<HTMLInputElement>('#checklist-repo')!;
+const checklistItems = document.querySelector<HTMLTextAreaElement>('#checklist-items')!;
+checklistRepo.addEventListener('change', () => { checklistItems.value = workflow?.checklists[checklistRepo.value.trim().toLowerCase()]?.join('\n') ?? ''; });
+function showWorkflow() {
+  for (const [key, value] of Object.entries(workflow.options)) {
+    const control = document.querySelector<HTMLInputElement>(`#workflow-${key}`)!;
+    if (typeof value === 'boolean') control.checked = value; else control.value = String(value);
+  }
+  githubToken.value = '';
+  document.querySelector('#github-token-state')!.textContent = workflow.githubToken ? 'A GitHub token is saved. Leave blank to keep it.' : 'No GitHub token saved.';
+  (document.querySelector('#remove-github-token') as HTMLButtonElement).disabled = !workflow.githubToken;
+}
+function readWorkflow(): WorkflowOptions {
+  const values = Object.fromEntries(Object.entries(DEFAULT_WORKFLOW).map(([key, value]) => {
+    const control = document.querySelector<HTMLInputElement>(`#workflow-${key}`)!;
+    return [key, typeof value === 'boolean' ? control.checked : Number(control.value)];
+  }));
+  return normalizeWorkflow(values);
+}
+
 const reloadWarning = 'Reload PR Reviewer in chrome://extensions, then reload GitHub to apply the saved AI provider, model, and response language.';
 
 function message(text: string, failed = false) {
@@ -28,7 +77,9 @@ async function workerUsesSettings(settings: AISettings): Promise<boolean> {
     return response.ok && !!response.status &&
       (response.status.provider === settings.provider || response.status.provider === undefined && settings.provider === 'openai') &&
       response.status.model === settings.model && response.status.language === settings.language &&
-      response.status.configured === !!settings.apiKey && response.status.enabled === settings.enabled;
+      response.status.configured === !!settings.apiKey && response.status.enabled === settings.enabled &&
+      !!response.status.options && JSON.stringify(normalizeWorkflow(response.status.options)) === JSON.stringify(workflow.options) &&
+      response.status.githubConfigured === !!workflow.githubToken;
   } catch { return false; }
 }
 
@@ -57,7 +108,7 @@ function showProvider(selected: AIProvider) {
   document.querySelector('#custom-model-hint')!.textContent = selected === 'openai' ?
     'Use a model that supports Responses structured outputs and low reasoning effort.' : 'Use a model that supports structured JSON output.';
   customModel.placeholder = `Enter a ${catalog.label} model ID`;
-  document.querySelector('.notice')!.textContent = `When enabled, opening a file sends its path and available diff to ${catalog.label}. The diff may be incomplete. ${catalog.label} API charges apply. The extension does not post comments or change your review.`;
+  document.querySelector('#ai-privacy')!.textContent = `Each AI analysis sends the selected path and diff/context to ${catalog.label}. Automatic analysis and expanded scope are configurable below. The diff may be incomplete. ${catalog.label} API charges apply. The extension does not post comments or change your review.`;
   model.replaceChildren(...catalog.models.map(id => {
     const option = document.createElement('option');
     option.value = id;
@@ -82,6 +133,7 @@ model.addEventListener('change', () => {
 async function load() {
   try {
     settings = await loadAISettings();
+    workflow = await loadWorkflowTrusted(); showWorkflow();
     provider.value = settings.provider;
     enabled.checked = settings.enabled;
     language.value = settings.language;
@@ -100,6 +152,11 @@ form.addEventListener('submit', async event => {
   const modelName = model.value === 'custom' ? customModel.value.trim() : model.value;
   const responseLanguage = language.value;
   const targetEnabled = enabled.checked;
+  const options = readWorkflow();
+  const repository = checklistRepo.value.trim().toLowerCase();
+  if (repository && !/^[\w.-]+\/[\w.-]+$/.test(repository)) return message('Enter a repository as owner/repo.', true);
+  const checklists = { ...workflow.checklists };
+  if (repository) checklists[repository] = checklistItems.value.split('\n').map(item => item.trim()).filter(Boolean).slice(0, 20).map(item => item.slice(0, 300));
   if (targetEnabled && !replacement && !configured) return message('Add an API key before enabling AI.', true);
   if (!/^[a-z\d][a-z\d._:-]{0,99}$/i.test(modelName)) return message(`Enter a valid ${catalog.label} model name.`, true);
   if (!isAILanguage(responseLanguage)) return message('Choose English or Español for the AI response language.', true);
@@ -109,12 +166,13 @@ form.addEventListener('submit', async event => {
   message('Saving…');
   try {
     // Request optional access directly from this user gesture, before any storage await.
-    if (targetEnabled && !await chrome.permissions.request({ origins: [catalog.origin] })) {
-      message(`${catalog.label} access was not allowed. Your settings were not changed.`, true);
-      return;
+    const origins = [...(targetEnabled ? [catalog.origin] : []), ...(options.expandedContext || options.moduleReview ? ['https://api.github.com/*'] : [])];
+    if (origins.length && !await chrome.permissions.request({ origins })) {
+      message(`${catalog.label} access was not allowed. Your settings were not changed.`, true); return;
     }
-    await saveAISettings({ provider: selected, apiKey: replacement || undefined, enabled: targetEnabled, model: modelName, language: responseLanguage });
+    await saveAISettings({ workflow: options, githubToken: githubToken.value || undefined, checklists, provider: selected, apiKey: replacement || undefined, enabled: targetEnabled, model: modelName, language: responseLanguage });
     settings = await loadAISettings();
+    workflow = await loadWorkflowTrusted(); showWorkflow();
     enabled.checked = settings.enabled;
     language.value = settings.language;
     showProvider(selected);
@@ -135,6 +193,7 @@ remove.addEventListener('click', async () => {
     await removeAIKey(selected);
     await chrome.permissions.remove({ origins: [catalog.origin] }).catch(() => undefined);
     settings = await loadAISettings();
+    workflow = await loadWorkflowTrusted(); showWorkflow();
     enabled.checked = settings.enabled;
     showProvider(selected);
     message(`${catalog.label} API key removed.${selected === settings.provider ? ' AI is disabled.' : ''}`);
@@ -143,3 +202,18 @@ remove.addEventListener('click', async () => {
 });
 
 void load();
+
+document.querySelector('#remove-github-token')!.addEventListener('click', async () => {
+  try { await chrome.storage.local.set({ [WORKFLOW_KEY]: { ...workflow, githubToken: '' } });
+    workflow = await loadWorkflowTrusted(); showWorkflow();
+    await chrome.storage.session.set({ 'pr-reviewer:ai-status-change': { nonce: crypto.randomUUID() } });
+    message('GitHub token removed. Public repositories can still use API context.');
+  } catch { message('Could not remove the GitHub token.', true); }
+});
+for (const kind of ['cache', 'progress']) document.querySelector(`#clear-${kind}`)!.addEventListener('click', async () => {
+  try {
+    const values = await chrome.storage.local.get(null);
+    for (const key of Object.keys(values).filter(key => key.startsWith(`pr-reviewer:${kind}:`))) await chrome.storage.local.remove(key);
+    message(kind === 'cache' ? 'Cached reviews cleared.' : 'Saved progress and notes cleared. Reload GitHub to update the panel.');
+  } catch { message('Could not clear local data.', true); }
+});

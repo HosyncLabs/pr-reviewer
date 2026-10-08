@@ -1,6 +1,7 @@
 import { createRoot, type Root } from 'react-dom/client';
 import { getPullRequest, readFiles, readExpectedCount, isPullRequestView } from './github';
 import { Panel, type Snapshot } from './Panel';
+import { readHeadRevision } from './review-context';
 import { CONTENT_VERSION } from './ai-protocol';
 import styles from './panel.css';
 
@@ -66,7 +67,7 @@ function mount() {
   });
   fileObserver.observe(document.body, {
     childList: true, subtree: true, characterData: true, attributes: true,
-    attributeFilter: ['data-path', 'data-tagsearch-path', 'data-anchor', 'data-file-deleted', 'id', 'title', 'href', 'role', 'aria-expanded', 'aria-labelledby', 'initial-path'],
+    attributeFilter: ['data-path', 'data-tagsearch-path', 'data-anchor', 'data-file-deleted', 'id', 'title', 'href', 'role', 'aria-expanded', 'aria-labelledby', 'initial-path', 'data-head-sha'],
   });
 }
 
@@ -79,7 +80,7 @@ function refresh() {
   mount();
   if (!root) return;
   const currentView = pr.isFilesPage && isPullRequestView(document, pr);
-  const snapshot: Snapshot = { pr, files: currentView ? readFiles(document) : [], expected: currentView ? readExpectedCount(document) : null, comparison: lastRoute };
+  const snapshot: Snapshot = { pr, files: currentView ? readFiles(document) : [], expected: currentView ? readExpectedCount(document) : null, comparison: lastRoute, headRevision: readHeadRevision(document) };
   const next = JSON.stringify(snapshot);
   if (next !== signature) {
     signature = next;

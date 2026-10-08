@@ -1,3 +1,4 @@
+import { WORKFLOW_KEY, normalizeWorkflow, type WorkflowOptions } from './workflow';
 import { isCategory, isImplementationGroup, type Category, type ClassificationRule, type ImplementationGroup } from './classifier';
 import { AI_PROVIDERS, AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, PREFERENCES_NOTICE, isAILanguage, isAIProvider, sendExtensionMessage, type AILanguage, type AIProvider, type ExtensionRequest } from './ai-protocol';
 
@@ -103,7 +104,7 @@ export async function loadAISettings(): Promise<AISettings> {
   return { ...providers[provider], provider, providers, language, enabled: stored.enabled === true && !!providers[provider].apiKey };
 }
 
-export async function saveAISettings(input: { provider?: AIProvider; apiKey?: string; enabled: boolean; model: string; language?: AILanguage }): Promise<void> {
+export async function saveAISettings(input: { provider?: AIProvider; apiKey?: string; enabled: boolean; model: string; language?: AILanguage; workflow?: WorkflowOptions; githubToken?: string; checklists?: Record<string, string[]> }): Promise<void> {
   if (input.provider !== undefined && !isAIProvider(input.provider)) throw new Error('Choose OpenAI, Gemini, or Claude.');
   if (input.language !== undefined && !isAILanguage(input.language)) throw new Error('Choose English or Spanish for AI responses.');
   const current = await loadAISettings();
@@ -115,7 +116,9 @@ export async function saveAISettings(input: { provider?: AIProvider; apiKey?: st
   if (!/^[a-z\d][a-z\d._:-]{0,99}$/i.test(model)) throw new Error(`Enter a valid ${AI_PROVIDERS[provider].label} model name.`);
   if (input.enabled && !apiKey) throw new Error('Add an API key before enabling AI.');
   const providers = { ...current.providers, [provider]: { apiKey, model } };
-  await chrome.storage.local.set({ [AI_SETTINGS_KEY]: { provider, providers, language, enabled: input.enabled && !!apiKey } });
+  if (input.githubToken !== undefined && input.githubToken.length > 512) throw new Error('The GitHub token is too long.');
+  const extra = input.workflow ? { [WORKFLOW_KEY]: { options: normalizeWorkflow(input.workflow), githubToken: input.githubToken?.trim() || (await loadWorkflowTrusted()).githubToken, checklists: input.checklists ?? (await loadWorkflowTrusted()).checklists } } : {};
+  await chrome.storage.local.set({ [AI_SETTINGS_KEY]: { provider, providers, language, enabled: input.enabled && !!apiKey }, ...extra });
   await chrome.storage.session.set({ [AI_STATUS_NOTICE]: { nonce: crypto.randomUUID() } });
 }
 
@@ -131,4 +134,14 @@ export async function removeAIKey(provider?: AIProvider): Promise<void> {
   await chrome.storage.session.set({ [AI_STATUS_NOTICE]: { nonce: crypto.randomUUID() } });
 }
 
-export const isAISettingsChange = (changes: Record<string, chrome.storage.StorageChange>) => Object.hasOwn(changes, AI_SETTINGS_KEY);
+export const isAISettingsChange = (changes: Record<string, chrome.storage.StorageChange>) => Object.hasOwn(changes, AI_SETTINGS_KEY) || Object.hasOwn(changes, WORKFLOW_KEY);
+
+export async function loadWorkflowTrusted(): Promise<{ options: WorkflowOptions; githubToken: string; checklists: Record<string, string[]> }> {
+  await secureStorage();
+  const raw = ((await chrome.storage.local.get(WORKFLOW_KEY))[WORKFLOW_KEY] ?? {}) as Record<string, unknown>;
+  const checklists: Record<string, string[]> = Object.create(null);
+  if (raw.checklists && typeof raw.checklists === 'object') for (const [repo, list] of Object.entries(raw.checklists)) {
+    if (/^[\w.-]+\/[\w.-]+$/.test(repo) && Array.isArray(list)) checklists[repo.toLowerCase()] = list.filter((item): item is string => typeof item === 'string' && !!item.trim()).slice(0, 20).map(item => item.trim().slice(0, 300));
+  }
+  return { options: normalizeWorkflow(raw.options), githubToken: typeof raw.githubToken === 'string' && raw.githubToken.length <= 512 ? raw.githubToken : '', checklists };
+}

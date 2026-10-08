@@ -1,3 +1,4 @@
+import { DEFAULT_WORKFLOW } from '../src/workflow.ts';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { AI_PROVIDERS, AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE, type AIProvider } from '../src/ai-protocol.ts';
@@ -61,11 +62,11 @@ test('AI worker protects credentials, scopes preferences, isolates providers, bo
   const { handleExtensionMessage, parseAIReview } = await import('../src/background.ts');
   const { loadAISettings, saveAISettings, subscribePreferences, removeAIKey } = await import('../src/storage.ts');
   const call = (message: unknown, from = sender) => handleExtensionMessage(message, from);
-  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: DEFAULT_AI_LANGUAGE, provider: 'openai' } });
+  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { options: DEFAULT_WORKFLOW, githubConfigured: false, checklist: [], configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: DEFAULT_AI_LANGUAGE, provider: 'openai' } });
   const legacy = stored['pr-reviewer:ai-settings'];
   stored['pr-reviewer:ai-settings'] = { ...(legacy as object), language: 'fr' };
   assert.equal((await loadAISettings()).language, 'en', 'Invalid saved languages fall back to English');
-  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: 'en', provider: 'openai' } });
+  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { options: DEFAULT_WORKFLOW, githubConfigured: false, checklist: [], configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: 'en', provider: 'openai' } });
   stored['pr-reviewer:ai-settings'] = legacy;
   const beforeInvalidLanguage = writes;
   await assert.rejects(saveAISettings({ enabled: true, model: DEFAULT_AI_MODEL, language: 'fr' as never }), /Choose English or Spanish/);
@@ -116,17 +117,17 @@ test('AI worker protects credentials, scopes preferences, isolates providers, bo
   for (const name of ['highlights', 'focus']) {
     assert.equal(schema.properties[name].maxItems, 5);
     assert.equal(schema.properties[name].items.additionalProperties, false);
-    assert.deepEqual(schema.properties[name].items.required, ['text', 'lines']);
+    assert.deepEqual(schema.properties[name].items.required, ['text', 'lines', 'suggestedComment', 'kind', 'severity', 'evidence', 'suggestion']);
     const lines = schema.properties[name].items.properties.lines;
     assert.equal(lines.maxItems, 3);
     assert.equal(lines.items.additionalProperties, false);
-    assert.deepEqual(lines.items.required, ['side', 'line']);
+    assert.deepEqual(lines.items.required, ['side', 'line', 'path']);
     assert.deepEqual(lines.items.properties.side.enum, ['left', 'right']);
     assert.deepEqual(lines.items.properties.line, { type: 'integer', minimum: 1 });
   }
   assert.match(requests[0].body.instructions, /Never invent references or infer numbers from hunk headers or unnumbered rows/);
   assert.deepEqual(requests[0].body.reasoning, { effort: 'low' });
-  assert.equal(requests[0].body.max_output_tokens, 2500);
+  assert.equal(requests[0].body.max_output_tokens, 4000);
   assert.deepEqual(JSON.parse(requests[0].body.input[0].content[0].text), context);
   await call(reviewMessage('same-context'));
   assert.equal(requests.length, 1, 'The same comparison and content reuse the memory cache');
@@ -145,8 +146,8 @@ test('AI worker protects credentials, scopes preferences, isolates providers, bo
   assert.deepEqual(spanish.ok && spanish.review?.highlights, [{ text: 'Reemplaza el comportamiento anterior.', lines: [{ side: 'right', line: 7 }] }], 'Spanish changes prose while reference metadata stays unchanged');
   assert.equal(requests.length, 5, 'Changing language must not reuse an English review');
   assert.match(requests[4].body.instructions, /string values in Spanish/);
-  assert.deepEqual(requests[4].body.text.format.schema.required, ['summary', 'highlights', 'focus']);
-  assert.deepEqual(Object.keys(requests[4].body.text.format.schema.properties).sort(), ['focus', 'highlights', 'summary']);
+  assert.deepEqual(requests[4].body.text.format.schema.required, ['summary', 'summaryComment', 'highlights', 'focus']);
+  assert.deepEqual(Object.keys(requests[4].body.text.format.schema.properties).sort(), ['focus', 'highlights', 'summary', 'summaryComment']);
   await call(reviewMessage('cached-spanish'));
   assert.equal(requests.length, 5, 'Matching Spanish reviews reuse the memory cache');
   await saveAISettings({ enabled: true, model: 'gpt-6-astra' });
@@ -195,7 +196,7 @@ test('AI worker protects credentials, scopes preferences, isolates providers, bo
     await saveAISettings({ provider, apiKey: '   ', enabled: true, model });
     assert.equal((await loadAISettings()).apiKey, profileKey, 'A blank direct settings save preserves the selected provider key');
     const status = await call({ type: 'ai-status' });
-    assert.deepEqual(status, { ok: true, status: { configured: true, enabled: true, model, language: 'es', provider } });
+    assert.deepEqual(status, { ok: true, status: { options: DEFAULT_WORKFLOW, githubConfigured: false, checklist: [], configured: true, enabled: true, model, language: 'es', provider } });
     assert.equal(JSON.stringify(status).includes(profileKey), false);
     let envelope: unknown = providerResponse(provider);
     globalThis.fetch = async (url, init) => {
@@ -238,7 +239,7 @@ test('AI worker protects credentials, scopes preferences, isolates providers, bo
       assert.equal(request.body.output_config.format.type, 'json_schema');
       const transport = request.body.output_config.format.schema;
       assert.equal(transport.additionalProperties, false);
-      assert.deepEqual(transport.required, ['summary', 'highlights', 'focus']);
+      assert.deepEqual(transport.required, ['summary', 'summaryComment', 'highlights', 'focus']);
       for (const name of ['highlights', 'focus']) {
         assert.equal(transport.properties[name].maxItems, undefined);
         assert.equal(transport.properties[name].items.additionalProperties, false);
@@ -330,7 +331,7 @@ test('AI worker protects credentials, scopes preferences, isolates providers, bo
   permission = false;
   assert.match(JSON.stringify(await call(reviewMessage('permission'))), /Allow access to OpenAI/);
   await removeAIKey();
-  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: false, enabled: false, model: DEFAULT_AI_MODEL, language: 'es', provider: 'openai' } });
+  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { options: DEFAULT_WORKFLOW, githubConfigured: false, checklist: [], configured: false, enabled: false, model: DEFAULT_AI_MODEL, language: 'es', provider: 'openai' } });
   assert.equal(parseAIReview({ ...responseData, status: 'incomplete' }), null);
   assert.equal(parseAIReview({ output: [{ type: 'message', content: [null, { type: 'refusal', refusal: 'No review' }] }] }), null);
   assert.equal(parseAIReview({ ...responseData, output_text: reviewText, output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'No review' }] }] }, context.diff), null, 'A refusal cannot be bypassed by a second text field');
@@ -340,6 +341,13 @@ test('AI worker protects credentials, scopes preferences, isolates providers, bo
   for (const malformed of [null, { text: 1, lines: [] }, { text: 'x', lines: '7' }]) {
     assert.equal(parseAIReview({ output_text: JSON.stringify({ summary: 'x', highlights: [malformed], focus: [] }) }, context.diff), null);
   }
+  for (const field of ['summaryComment', 'suggestedComment']) {
+    const malformed = field === 'summaryComment' ? { summaryComment: 12 } : { highlights: [{ text: 'x', lines: [], suggestedComment: 12 }] };
+    assert.equal(parseAIReview({ output_text: JSON.stringify({ summary: 'x', highlights: [], focus: [], ...malformed }) }), null);
+  }
+  const withDrafts = parseAIReview({ output_text: JSON.stringify({ summary: 'x', summaryComment: ' ¿Podemos probar el cambio? ', highlights: [{ text: 'x', lines: [], suggestedComment: ' ' + 'a'.repeat(2500) + ' ' }], focus: [] }) });
+  assert.equal(withDrafts?.summaryComment, '¿Podemos probar el cambio?');
+  assert.equal(withDrafts?.highlights[0].suggestedComment?.length, 2000);
   const clean = parseAIReview({ output_text: JSON.stringify({ summary: 'x', highlights: Array(8).fill({ text: 'highlight', lines: [] }), focus: [], extra: key }) }, context.diff);
   assert.equal(clean?.highlights.length, 5);
   assert.equal(JSON.stringify(clean).includes(key), false);

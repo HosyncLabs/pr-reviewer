@@ -1,3 +1,4 @@
+import { normalizeWorkflow } from '../src/workflow.ts';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
@@ -13,7 +14,7 @@ const settingsKey = 'pr-reviewer:ai-settings';
 type Settings = { apiKey: string; enabled: boolean; model: string; language?: 'en' | 'es' };
 type Profiles = Record<AIProvider, { apiKey: string; model: string }>;
 type ProfileSettings = { provider: AIProvider; providers: Profiles; enabled: boolean; language: 'en' | 'es' };
-type WorkerMode = 'current' | 'old-language' | 'old-provider' | 'old-model' | 'old-response-language';
+type WorkerMode = 'current' | 'old-language' | 'old-provider' | 'old-model' | 'old-response-language' | 'old-workflow';
 const activeSettings = (stored: Record<string, unknown>): Settings => {
   const raw = stored[settingsKey] as Partial<ProfileSettings & Settings> | undefined;
   const provider = isAIProvider(raw?.provider) ? raw.provider : 'openai';
@@ -55,6 +56,8 @@ function optionsPage(stored: Record<string, unknown>, workerMode: WorkerMode = '
         const settings = activeSettings(stored);
         const provider = (stored[settingsKey] as Partial<ProfileSettings> | undefined)?.provider ?? 'openai';
         return { ok: true, status: {
+          options: workerMode === 'old-workflow' ? undefined : normalizeWorkflow((stored['pr-reviewer:workflow'] as any)?.options),
+          githubConfigured: !!(stored['pr-reviewer:workflow'] as any)?.githubToken,
           configured: !!settings.apiKey,
           enabled: settings.enabled,
           model: workerMode === 'old-model' ? 'old-model' : settings.model,
@@ -392,4 +395,31 @@ test('built options require a worker with matching provider, model and language'
   assert.equal(compatible.status.textContent, '', 'An otherwise matching old OpenAI worker may omit the provider field');
   assert.equal(compatible.status.classList.contains('error'), false);
   for (const page of pages) assert.deepEqual(page.errors, []);
+});
+
+test('settings make expanded scopes optional and preserve private GitHub credentials while saving checklists and limits', async t => {
+  const stored: Record<string, unknown> = {
+    [settingsKey]: { apiKey: 'test-ai-key', model: DEFAULT_AI_MODEL, enabled: true, language: 'en' },
+    'pr-reviewer:workflow': { options: { automatic: false, moduleReview: true, expandedContext: true }, githubToken: 'test-only-private-github-token', checklists: { 'acme/example': ['Tenant isolation'] } },
+  };
+  const page = optionsPage(stored); t.after(() => page.dom.window.close());
+  await until(() => !page.save.disabled);
+  const input = (key: string) => page.document.querySelector<HTMLInputElement>(`#workflow-${key}`)!;
+  assert.equal(input('automatic').checked, false);
+  assert.equal(input('moduleReview').checked, true);
+  const token = page.document.querySelector<HTMLInputElement>('#github-token')!;
+  assert.equal(token.value, ''); assert.equal(page.document.body.textContent?.includes('test-only-private-github-token'), false);
+  const repository = page.document.querySelector<HTMLInputElement>('#checklist-repo')!;
+  repository.value = 'acme/example'; repository.dispatchEvent(new page.window.Event('change', { bubbles: true }));
+  const items = page.document.querySelector<HTMLTextAreaElement>('#checklist-items')!;
+  assert.equal(items.value, 'Tenant isolation'); items.value += '\nMigration rollback';
+  input('dailyRequests').value = '8'; input('checklist').checked = true; input('syncViewed').checked = false;
+  page.submit(); await until(() => page.counts().writes === 1 && !page.save.disabled);
+  const workflow = stored['pr-reviewer:workflow'] as { options: Record<string, unknown>; githubToken: string; checklists: Record<string, string[]> };
+  assert.equal(workflow.githubToken, 'test-only-private-github-token'); assert.equal(workflow.options.dailyRequests, 8); assert.equal(workflow.options.automatic, false);
+  assert.deepEqual(workflow.checklists['acme/example'], ['Tenant isolation', 'Migration rollback']);
+  assert.deepEqual(page.requested[0], [AI_PROVIDERS.openai.origin, 'https://api.github.com/*']);
+  const fresh = optionsPage({}); t.after(() => fresh.dom.window.close()); await until(() => !fresh.save.disabled);
+  assert.equal(fresh.document.querySelector<HTMLInputElement>('#workflow-expandedContext')!.checked, false);
+  assert.equal(fresh.document.querySelector<HTMLInputElement>('#workflow-moduleReview')!.checked, false);
 });

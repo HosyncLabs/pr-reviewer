@@ -1,3 +1,5 @@
+import { webcrypto } from 'node:crypto';
+import { DEFAULT_WORKFLOW, sameDiffRevision } from '../src/workflow';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
@@ -66,7 +68,9 @@ function page(url = 'https://github.com/acme/example/pull/12/files', stored: Sto
     <main id="native-files">${filesHTML(initialPaths)}</main>
   `}</body></html>`, { url, runScripts: 'outside-only', pretendToBeVisual: true, virtualConsole });
   const { window } = dom;
+  Object.defineProperty(window.crypto, 'subtle', { value: webcrypto.subtle });
   Object.assign(window, {
+    TextEncoder, TextDecoder,
     matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
     chrome: {
       runtime: { sendMessage: async (message: ExtensionRequest): Promise<ExtensionResponse> => {
@@ -76,6 +80,21 @@ function page(url = 'https://github.com/acme/example/pull/12/files', stored: Sto
         if (message.type === 'ai-status') return { ok: true, status: { configured: false, enabled: false, model: DEFAULT_AI_MODEL, language: 'en' } };
         if (message.type === 'ai-open-settings' || message.type === 'ai-cancel') return { ok: true };
         if (message.type === 'ai-review') return { ok: false, error: 'AI review is not configured in this test.' };
+        if (message.type === 'github-context') return { ok: false, error: 'API context is not configured in this fixture.' };
+        const progressKey = 'test:progress:' + new URL(window.document.URL).pathname + new URL(window.document.URL).search;
+        if (message.type === 'progress-load') return { ok: true, progress: structuredClone(stored[progressKey] ?? { files: {}, lastFile: '' }) as any };
+        if (message.type === 'progress-save') {
+          const progress: any = stored[progressKey] ?? { files: {}, lastFile: '' };
+          let file = progress.files[message.path] ?? { revision: '', reviewed: false, note: '', blocks: {}, checks: {} };
+          if (message.revision && message.revision !== file.revision) file = sameDiffRevision(file.revision, message.revision) ? { ...file, revision: message.revision } : { revision: message.revision, reviewed: false, note: file.note, blocks: {}, checks: {} };
+          if (message.reviewed !== undefined) file.reviewed = message.reviewed;
+          if (message.note !== undefined) file.note = message.note;
+          if (message.block) { if (message.block.state) file.blocks[message.block.key] = message.block.state; else delete file.blocks[message.block.key]; }
+          if (message.check) file.checks[message.check.key] = message.check.checked;
+          if (message.lastFile) progress.lastFile = message.path;
+          progress.files[message.path] = file; stored[progressKey] = progress;
+          return { ok: true, progress: structuredClone(progress) };
+        }
         if (message.type !== 'preferences-load') {
           const key = `pr-reviewer:repo:${message.repository.toLowerCase()}:${message.type === 'preferences-category' ? 'file' : 'implementation'}:${message.path}`;
           const value = message.type === 'preferences-category' ? message.category : message.group;
@@ -118,6 +137,145 @@ async function openPanel(window: JSDOM['window']) {
 const links = (root: ParentNode) => [...root.querySelectorAll<HTMLAnchorElement>('a.file-link')];
 const paths = (root: ParentNode) => links(root).map(link => link.title).sort();
 const reviewComment = (text: string, side: 'left' | 'right' = 'right') => ({ text, lines: [{ side, line: 1 }] });
+
+test('adds AI comment drafts through native controls and collapses reviewed blocks without publishing', async t => {
+  const path = 'src/service.ts';
+  const html = `<a href="/acme/example/pull/12/files"><span id="files_tab_counter">1</span></a>
+    <div class="file" id="${anchor(0)}" data-tagsearch-path="${path}">
+      <div class="file-header" data-path="${path}"><a href="#${anchor(0)}" title="${path}">${path}</a><button>Comment on this file</button><input type="checkbox" aria-label="Viewed" checked></div>
+      <table><tbody><tr><td class="blob-num" id="${anchor(0)}R1" data-line-number="1"><button aria-label="Add a comment on line R1"></button></td><td class="blob-code"><span class="blob-code-inner" data-code-marker="+">const currency = input.currency ?? 'USD';</span></td></tr></tbody></table>
+    </div>`;
+  const current = page(undefined, {}, html, message => {
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture', language: 'es' } };
+    if (message.type === 'ai-review') return { ok: true, review: {
+      summary: 'El cambio añade una moneda predeterminada.', summaryComment: '¿Podemos documentar cuándo se aplica la moneda predeterminada?',
+      highlights: [{ text: 'Se usa USD si falta la moneda.', lines: [{ side: 'right', line: 1 }], suggestedComment: '¿Podemos probar una solicitud sin moneda y otra con moneda explícita?' }],
+      focus: [{ text: 'Verifica la entrada vacía.', lines: [], suggestedComment: '¿Qué debe ocurrir cuando la moneda es una cadena vacía?' }],
+    } };
+  });
+  t.after(() => current.dom.window.close());
+  const { document } = current.window;
+  const nativeFile = document.getElementById(anchor(0))!;
+  let submitted = 0, nativeOpens = 0;
+  const mountComposer = (scope: Element, line: string) => {
+    scope.insertAdjacentHTML('beforeend', `<div class="js-inline-comments-container"><h4>Add a comment on ${line}</h4><textarea aria-label="Markdown value"></textarea><button>Comment</button><button>Start a review</button></div>`);
+    scope.querySelectorAll<HTMLButtonElement>('.js-inline-comments-container button').forEach(button => { button.onclick = () => { submitted++; }; });
+  };
+  nativeFile.querySelector<HTMLButtonElement>('tr button')!.onclick = () => { nativeOpens++; mountComposer(nativeFile.querySelector('tr td:last-child')!, 'line R1'); };
+  nativeFile.querySelector<HTMLButtonElement>('.file-header button')!.onclick = () => { nativeOpens++; mountComposer(nativeFile, 'this file'); };
+  const shadow = await openPanel(current.window);
+  (await until(() => links(shadow)[0], 'file link')).click();
+  await until(() => shadow.querySelector('.ai-result'), 'AI blocks');
+  assert.equal(shadow.querySelectorAll('.ai-block-actions button').length, 8, 'Both actions appear on Summary, Highlights and Review focus');
+  const button = (block: Element, label: string) => [...block.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === label)!;
+  const summary = shadow.querySelector('.ai-summary-card')!;
+  const highlight = shadow.querySelector('.ai-highlights .ai-comment')!;
+  const focus = shadow.querySelector('.ai-focus .ai-comment')!;
+  button(highlight, 'Reviewed').click();
+  await until(() => highlight.classList.contains('is-collapsed'), 'Reviewed collapses');
+  assert.equal(highlight.classList.contains('is-reviewed'), true);
+  const disclosure = highlight.querySelector<HTMLButtonElement>('.ai-reviewed-toggle')!;
+  assert.equal(disclosure.getAttribute('aria-expanded'), 'false');
+  assert.equal(shadow.getElementById(disclosure.getAttribute('aria-controls')!)!.hidden, true);
+  assert.strictEqual(shadow.activeElement, disclosure);
+  assert.match(shadow.querySelector('style')!.textContent!, /\.ai-result \.is-reviewed \{ background:var\(--reviewed-bg\)/);
+  disclosure.click();
+  await until(() => !highlight.classList.contains('is-collapsed'), 'reopen Reviewed block');
+  assert.equal(highlight.classList.contains('is-reviewed'), true);
+  button(highlight, 'Add comment').click();
+  const editor = await until(() => nativeFile.querySelector<HTMLTextAreaElement>('textarea')?.value ? nativeFile.querySelector<HTMLTextAreaElement>('textarea') : null, 'AI suggestion in native editor');
+  assert.equal(editor.value, '¿Podemos probar una solicitud sin moneda y otra con moneda explícita?');
+  assert.strictEqual(document.activeElement, editor);
+  assert.equal(current.window.location.hash, `#${anchor(0)}R1`);
+  await until(() => highlight.textContent?.includes('Draft added in GitHub'), 'successful draft notice');
+  editor.value = 'My edited draft';
+  button(highlight, 'Add comment').click();
+  await until(() => highlight.textContent?.includes('Your existing draft was preserved'), 'existing draft preserved');
+  assert.equal(editor.value, 'My edited draft');
+  assert.equal(nativeOpens, 1);
+  button(focus, 'Add comment').click();
+  await until(() => focus.textContent?.includes('Finish or cancel your existing GitHub draft'), 'unrelated draft protection');
+  assert.equal(focus.querySelector('textarea')!.value, '¿Qué debe ocurrir cuando la moneda es una cadena vacía?');
+  assert.equal(editor.value, 'My edited draft');
+  editor.closest('.js-inline-comments-container')!.remove();
+  button(summary, 'Add comment').click();
+  await until(() => nativeFile.querySelector<HTMLTextAreaElement>('textarea')?.value === '¿Podemos documentar cuándo se aplica la moneda predeterminada?', 'Summary file comment');
+  await until(() => summary.textContent?.includes('Draft added in GitHub'), 'Summary draft notice');
+  button(summary, 'Reviewed').click();
+  await until(() => summary.classList.contains('is-reviewed') && summary.classList.contains('is-collapsed'), 'Summary Reviewed');
+  const viewButton = (label: string) => [...shadow.querySelectorAll<HTMLButtonElement>('.panel-views button')].find(button => button.textContent === label)!;
+  viewButton('Files').click();
+  await until(() => shadow.querySelector<HTMLElement>('.ai-review')!.hidden, 'Files view');
+  viewButton('AI review').click();
+  await until(() => !shadow.querySelector<HTMLElement>('.ai-review')!.hidden, 'AI view returns');
+  assert.equal(summary.classList.contains('is-collapsed'), true, 'Reviewed survives switching views');
+  const analysis = shadow.querySelector('.ai-result')!;
+  shadow.querySelector<HTMLButtonElement>('button[aria-label="Collapse panel"]')!.click();
+  await until(() => shadow.querySelector<HTMLElement>('#pr-reviewer-panel-content')!.hidden, 'AI panel collapsed horizontally');
+  assert.strictEqual(shadow.querySelector('.ai-result'), analysis);
+  shadow.querySelector<HTMLButtonElement>('button[aria-label="Expand panel"]')!.click();
+  await until(() => !shadow.querySelector<HTMLElement>('#pr-reviewer-panel-content')!.hidden, 'AI panel expanded');
+  assert.strictEqual(shadow.querySelector('.ai-result'), analysis);
+  assert.equal(summary.classList.contains('is-collapsed'), true, 'Reviewed survives collapsing the whole panel');
+  assert.equal(nativeFile.querySelector('textarea')!.value, '¿Podemos documentar cuándo se aplica la moneda predeterminada?');
+  button(highlight, 'Undo reviewed').click();
+  await until(() => !highlight.classList.contains('is-reviewed'), 'undo Reviewed');
+  assert.equal(nativeFile.querySelector('input')!.checked, true);
+  assert.equal(submitted, 0, 'No posting or review submission controls were clicked');
+  assert.equal(current.messages.filter(message => message.type === 'ai-review').length, 1, 'Drafts come from the original review, with no extra provider call');
+  assert.equal(current.messages.some(message => JSON.stringify(message).includes('My edited draft')), false);
+  assert.deepEqual(current.errors, []);
+});
+
+test('folds the panel into a side rail and restores search, groups, scroll, focus and native drafts', async t => {
+  const current = page();
+  t.after(() => current.dom.window.close());
+  const { window } = current;
+  const shadow = await openPanel(window);
+  await until(() => links(shadow).length === initialPaths.length, 'file inventory');
+  const panel = shadow.querySelector('aside')!;
+  const content = shadow.getElementById('pr-reviewer-panel-content')!;
+  const launcher = shadow.querySelector<HTMLButtonElement>('button.launcher')!;
+  const collapse = shadow.querySelector<HTMLButtonElement>('button[aria-label="Collapse panel"]')!;
+  const expand = shadow.querySelector<HTMLButtonElement>('button[aria-label="Expand panel"]')!;
+  const search = shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!;
+  const groups = shadow.querySelector<HTMLElement>('.groups')!;
+  const implementation = shadow.querySelector<HTMLDetailsElement>('.group.implementation')!;
+  const draft = window.document.querySelector('textarea')!;
+  const viewed = window.document.querySelector('input')!;
+  draft.value = 'Keep my native draft'; viewed.checked = true;
+  Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')!.set!.call(search, 'client');
+  search.dispatchEvent(new window.Event('input', { bubbles: true }));
+  await until(() => links(shadow).length === 2, 'filtered files');
+  implementation.open = false; groups.scrollTop = 127;
+  collapse.click();
+  await until(() => panel.classList.contains('is-collapsed') && content.hidden, 'side rail');
+  assert.strictEqual(shadow.querySelector('aside'), panel);
+  assert.equal(launcher.hidden, true, 'No large bottom launcher remains while the rail is open');
+  assert.equal(expand.getAttribute('aria-expanded'), 'false');
+  assert.equal(expand.getAttribute('aria-controls'), content.id);
+  assert.strictEqual(shadow.activeElement, expand, 'Focus moves out of the hidden content');
+  assert.equal(shadow.querySelector<HTMLElement>('.panel-rail')!.hidden, false);
+  expand.click();
+  await until(() => !panel.classList.contains('is-collapsed') && !content.hidden, 'expanded panel');
+  assert.equal(collapse.getAttribute('aria-expanded'), 'true');
+  assert.equal(search.value, 'client');
+  assert.deepEqual(paths(shadow), ['src/client.ts', 'tests/client.test.ts']);
+  assert.equal(implementation.open, false);
+  assert.equal(groups.scrollTop, 127);
+  assert.strictEqual(shadow.activeElement, search);
+  assert.equal(draft.value, 'Keep my native draft'); assert.equal(viewed.checked, true);
+  collapse.click();
+  await until(() => panel.classList.contains('is-collapsed'), 'collapse again');
+  shadow.querySelector<HTMLButtonElement>('.panel-rail button[aria-label="Close panel"]')!.click();
+  await until(() => !shadow.querySelector('aside'), 'rail close');
+  assert.equal(launcher.hidden, false);
+  assert.strictEqual(shadow.activeElement, launcher);
+  launcher.click();
+  await until(() => shadow.querySelector('aside') && !shadow.querySelector('aside')!.classList.contains('is-collapsed'), 'reopen expanded panel');
+  assert.equal(shadow.querySelector<HTMLInputElement>('input[aria-label="Search files"]')!.value, 'client');
+  assert.deepEqual(current.errors, []);
+});
 
 test('isolates editable panel keyboard events from GitHub shortcuts without cancelling editing defaults', async t => {
   const observed: string[] = [];
@@ -788,7 +946,7 @@ test('groups monorepo packages across implementation areas while preserving lega
   ] as const) {
     const packageModule = module(group, `packages/${name}`);
     assert.deepEqual(paths(packageModule), indices.map(index => fixturePaths[index]).sort());
-    assert.equal(packageModule.firstElementChild?.firstElementChild?.textContent, name);
+    assert.equal(packageModule.firstElementChild?.firstElementChild?.childNodes[0].textContent, name);
     assert.equal(count(packageModule), String(indices.length));
   }
   assert.deepEqual(links(module('frontend', 'packages/mira-widgets')).map(link => link.title), [3, 4, 2].map(index => fixturePaths[index]));
@@ -799,7 +957,7 @@ test('groups monorepo packages across implementation areas while preserving lega
     assert.ok(legacyLink);
     assert.strictEqual(legacyLink.closest('details.implementation-module'), module(group, ''));
     assert.deepEqual(paths(module(group, '')), [fixturePaths[index]]);
-    assert.equal(module(group, '').firstElementChild?.firstElementChild?.textContent, 'General');
+    assert.equal(module(group, '').firstElementChild?.firstElementChild?.childNodes[0].textContent, 'General');
   }
   assert.equal(count(implementation), '15');
   assert.equal(new Set(paths(shadow)).size, fixturePaths.length);
@@ -822,7 +980,7 @@ test('groups monorepo packages across implementation areas while preserving lega
   correction.value = 'backend';
   correction.dispatchEvent(new window.Event('change', { bubbles: true }));
   await until(() => subgroup('backend')?.querySelector(`details.implementation-module[data-module="packages/mira-widgets"] a[title="${movedPath}"]`), 'manual area preserves package module');
-  assert.equal(module('backend', 'packages/mira-widgets').firstElementChild?.firstElementChild?.textContent, 'mira-widgets');
+  assert.equal(module('backend', 'packages/mira-widgets').firstElementChild?.firstElementChild?.childNodes[0].textContent, 'mira-widgets');
   assert.deepEqual(paths(module('backend', 'packages/mira-widgets')), [movedPath]);
   assert.deepEqual(paths(module('frontend', 'packages/mira-widgets')), [fixturePaths[2], fixturePaths[4]].sort());
   assert.equal(count(implementation), '5/15');
@@ -941,7 +1099,7 @@ test('reviews only the selected diff through the background bridge and ignores a
   assert.ok(alphaRequest.context.diff.includes('[new line 1] +export const alpha = 1;'));
   assert.equal(alphaRequest.context.diff.includes('export const beta'), false);
   assert.equal(shadow.querySelector<HTMLElement>('.ai-review')?.hidden, false);
-  assert.ok(shadow.querySelector('.ai-loading')?.textContent?.includes('Generating review'));
+  await until(() => shadow.querySelector('.ai-loading')?.textContent?.includes('Generating review'), 'generating state');
   const filesView = [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Files')!;
   filesView.click();
   links(shadow).find(link => link.title === fixturePaths[1])!.click();
@@ -1283,4 +1441,92 @@ test('recovers from an invalidated extension without crashing on review or cance
     assert.strictEqual(current.window.document.querySelector('textarea'), draft);
     assert.strictEqual(current.window.document.querySelector('input[aria-label="Viewed"]'), viewed);
   });
+});
+
+test('manual workflow saves notes and progress, skips reviewed files, dismisses blocks and opens editable suggestions', async t => {
+  const fixturePaths = ['backend/src/api/v1/payment/router.ts', 'backend/src/api/v1/payment/types.ts'];
+  const html = `<a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">2</span></a>${fixturePaths.map((path, index) => `<section id="${anchor(index)}" data-tagsearch-path="${path}"><div class="file-header" data-path="${path}" data-anchor="${anchor(index)}"><a title="${path}" href="#${anchor(index)}">${path}</a><label><input type="checkbox" aria-label="Viewed">Viewed</label></div><table><tr><td id="${anchor(index)}R1" class="blob-num" data-line-number="1">1<button class="add-line-comment" aria-label="Add a comment on line R1"></button></td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">return input;</span></td></tr></table></section>`).join('')}`;
+  let calls = 0;
+  const stored: Record<string, unknown> = {};
+  const handler = async (message: ExtensionRequest): Promise<ExtensionResponse | undefined> => {
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture', language: 'en', options: { ...DEFAULT_WORKFLOW, automatic: false, syncViewed: true, checklist: true }, checklist: ['Tenant isolation'] } };
+    if (message.type === 'ai-review') { calls++; return { ok: true, review: { summary: 'Changes return value.', highlights: [], focus: [{ text: 'Could the input be null?', kind: 'question', severity: 'medium', evidence: 'Input is returned directly.', lines: [{ side: 'right', line: 1 }], suggestion: { line: 1, code: 'return input ?? null;' } }], usage: { input: 100, output: 20, total: 120 } } }; }
+  };
+  const current = page(undefined, stored, html, handler); t.after(() => current.dom.window.close());
+  const shadow = await openPanel(current.window);
+  const button = (label: string) => [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === label)!;
+  links(shadow)[0].click();
+  await until(() => button('Analyze file'), 'manual analyze button'); assert.equal(calls, 0);
+  button('Analyze file').click(); await until(() => shadow.querySelector('.ai-result'), 'manual result'); assert.equal(calls, 1);
+  assert.match(shadow.querySelector('.ai-usage')!.textContent!, /100 input \+ 20 output/);
+  assert.match(shadow.querySelector('.finding-meta')!.textContent!, /Questionmedium severity/);
+  const native = current.window.document.querySelector<HTMLButtonElement>('.add-line-comment')!;
+  native.onclick = () => { native.closest('tr')!.lastElementChild!.insertAdjacentHTML('beforeend', '<div class="js-inline-comments-container"><h4>Add a comment on line R1</h4><textarea aria-label="Markdown value"></textarea></div>'); };
+  button('Add suggestion').click();
+  const editor = await until(() => current.window.document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Markdown value"]')?.value ? current.window.document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Markdown value"]') : null, 'suggestion draft');
+  assert.equal(editor.value, '```suggestion\nreturn input ?? null;\n```');
+  [...shadow.querySelectorAll<HTMLButtonElement>('.ai-focus button')].find(button => button.textContent === 'Reviewed')!.click(); await until(() => shadow.querySelector('.ai-focus .is-reviewed'), 'reviewed finding');
+  const note = shadow.querySelector<HTMLTextAreaElement>('#review-note')!;
+  const setter = Object.getOwnPropertyDescriptor(current.window.HTMLTextAreaElement.prototype, 'value')!.set!;
+  setter.call(note, 'private reviewer note'); note.dispatchEvent(new current.window.Event('input', { bubbles: true, composed: true }));
+  note.focus(); note.blur();
+  const fileKey = 'test:progress:/acme/example/pull/12/files';
+  await until(() => (stored[fileKey] as any)?.files[fixturePaths[0]]?.note === 'private reviewer note', 'saved private note');
+  button('Files').click();
+  const mark = shadow.querySelector<HTMLButtonElement>('.file-reviewed')!; mark.click();
+  await until(() => mark.textContent === '✓ File reviewed', 'file completion');
+  await until(() => current.window.document.querySelector<HTMLInputElement>('input[aria-label="Viewed"]')!.checked, 'native Viewed sync');
+  button('Next pending').click(); await until(() => shadow.querySelector('.selected .file-link')?.getAttribute('title') === fixturePaths[1], 'next pending file');
+  assert.equal(calls, 1, 'Next pending does not automatically analyze in manual mode');
+  links(shadow)[0].click(); button('AI review').click(); await until(() => button('Analyze file'), 'manual second visit'); button('Analyze file').click();
+  await until(() => shadow.querySelector('.ai-focus .is-reviewed'), 'finding progress survives file switch');
+  const toggle = shadow.querySelector<HTMLButtonElement>('.ai-focus .ai-reviewed-toggle')!; toggle.click();
+  button('Dismiss').click(); await until(() => shadow.querySelector('.ai-dismissed'), 'dismiss finding');
+  button('Undo dismiss').click(); await until(() => shadow.querySelector('.ai-focus .ai-comment'), 'restore finding');
+  assert.equal(JSON.stringify(current.messages.filter(message => message.type === 'ai-review')).includes('private reviewer note'), false);
+  assert.deepEqual(current.errors, []);
+  // A reload reuses local progress without making a provider call until explicitly requested.
+  const reloaded = page(undefined, stored, html, handler); t.after(() => reloaded.dom.window.close());
+  const nextShadow = await openPanel(reloaded.window);
+  await until(() => [...nextShadow.querySelectorAll<HTMLButtonElement>('.file-reviewed')].some(button => button.textContent === '✓ File reviewed'), 'file progress survives reload');
+});
+
+test('module analysis follows references across packages and rejects a mismatched API revision', async t => {
+  const fixturePaths = ['packages/mira-api/src/order.ts', 'packages/mira-widgets/src/order.tsx'];
+  const route = '/acme/example/pull/12/files';
+  const html = `<a class="tabnav-tab" href="${route}"><span id="files_tab_counter">2</span></a>${fixturePaths.map((path, index) => `<section id="${anchor(index)}" data-tagsearch-path="${path}"><div class="file-header" data-path="${path}" data-anchor="${anchor(index)}"><a title="${path}" href="#${anchor(index)}">${path}</a></div><table><tr><td id="${anchor(index)}R1" class="blob-num" data-line-number="1">1</td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">return input;</span></td></tr></table></section>`).join('')}`;
+  let mismatched = false, calls = 0;
+  const current = page(undefined, {}, html, async message => {
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture', language: 'en', options: { ...DEFAULT_WORKFLOW, automatic: false, moduleReview: true } } };
+    if (message.type === 'github-context') {
+      assert.deepEqual(Array.from(message.relatedPaths ?? []), [fixturePaths[1]]); assert.equal(message.scope, 'module');
+      return { ok: true, context: { path: fixturePaths[0], diff: '[new line 1] +' + (mismatched ? 'stale' : 'return input;'), partial: false, scope: 'module', related: [{ path: fixturePaths[1], diff: '[new line 1] +return input;', partial: false }] } };
+    }
+    if (message.type === 'ai-review') { calls++; return { ok: true, review: { summary: 'Checks the package contract.', highlights: [{ text: 'Verify the widget caller.', lines: [{ path: fixturePaths[1], side: 'right', line: 1 }] }], focus: [] } }; }
+  }); t.after(() => current.dom.window.close());
+  const shadow = await openPanel(current.window); links(shadow).find(link => link.title === fixturePaths[0])!.click();
+  const button = (name: string) => [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === name)!;
+  button('AI review').click(); await until(() => shadow.querySelector('.module-review-controls'), 'module controls');
+  shadow.querySelector<HTMLDetailsElement>('.module-review-controls')!.open = true;
+  const related = shadow.querySelector<HTMLInputElement>('.module-review-controls input')!; related.click(); button('Analyze module').click();
+  await until(() => shadow.querySelector('.ai-result') || shadow.querySelector('.ai-error'), 'module result'); assert.equal(shadow.querySelector('.ai-error')?.textContent, undefined, JSON.stringify(current.messages)); assert.equal(calls, 1);
+  const chip = shadow.querySelector<HTMLAnchorElement>('.ai-line-chip')!;
+  assert.equal(chip.getAttribute('href'), `#${anchor(1)}R1`); chip.click();
+  await until(() => current.window.location.hash === `#${anchor(1)}R1`, 'related package line navigation');
+  assert.equal(shadow.querySelector('.ai-file')!.textContent, fixturePaths[0], 'Line jumps preserve the module analysis');
+  mismatched = true; button('Refresh review').click();
+  await until(() => shadow.querySelector('.ai-error')?.textContent?.includes('does not match'), 'stale API revision rejection');
+  assert.equal(calls, 1, 'A mismatched API context must not be sent to AI');
+  assert.deepEqual(current.errors, []);
+});
+
+test('whole-file progress also supports rendered image diffs without calling AI', async t => {
+  const path = 'frontend/images/logo.png';
+  const current = page(undefined, {}, `<a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">1</span></a><section id="${anchor(0)}" data-tagsearch-path="${path}"><div class="file-header" data-path="${path}" data-anchor="${anchor(0)}"><a href="#${anchor(0)}" title="${path}">${path}</a></div><img src="https://github.com/acme/example/raw/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/frontend/images/logo.png" alt="Changed image"></section>`);
+  t.after(() => current.dom.window.close());
+  const shadow = await openPanel(current.window); const mark = shadow.querySelector<HTMLButtonElement>('.file-reviewed')!;
+  mark.click(); await until(() => mark.textContent === '✓ File reviewed', 'image reviewed');
+  assert.equal(current.messages.some(message => message.type === 'ai-review'), false);
+  assert.equal(shadow.querySelector('.error'), null);
+  assert.deepEqual(current.errors, []);
 });

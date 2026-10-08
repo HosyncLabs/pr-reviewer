@@ -1,4 +1,5 @@
 import { getPullRequest, isPullRequestView, readFiles, type PullRequestFile } from './github';
+import { fingerprint } from './workflow';
 import type { AIReviewLine } from './ai-protocol';
 
 export type ReviewContext = { path: string; diff: string; partial: boolean };
@@ -159,7 +160,7 @@ function codeLine(cell: Element, anchor: string): CodeLine {
   return semanticLine(cell, marker, anchor) ?? { marker, reference: lineReference(cell, marker, anchor) };
 }
 
-function selectedDiff(file: PullRequestFile, document: Document): { target: HTMLElement; current: PullRequestFile } | null {
+export function selectedDiff(file: PullRequestFile, document: Document): { target: HTMLElement; current: PullRequestFile } | null {
   const pr = getPullRequest(document.URL);
   const current = readFiles(document).find(current => current.path === file.path && current.anchor === file.anchor);
   if (!pr?.isFilesPage || !isPullRequestView(document, pr) || !current) throw new Error(STALE_ERROR);
@@ -257,4 +258,57 @@ export async function collectReviewContext(
     signal?.addEventListener('abort', abort, { once: true });
     check();
   });
+}
+
+export function readHeadRevision(document: Document = globalThis.document): string {
+  for (const element of document.querySelectorAll('[data-head-sha], meta[name="pull-request-head-sha"]')) {
+    const value = element.getAttribute('data-head-sha') ?? element.getAttribute('content');
+    if (/^[a-f\d]{40,64}$/i.test(value ?? '')) return value!;
+  }
+  for (const app of document.querySelectorAll('react-app[app-name="repo"][initial-path]')) {
+    try {
+      const url = new URL(app.getAttribute('initial-path')!, document.URL);
+      if (url.pathname + url.search !== new URL(document.URL).pathname + new URL(document.URL).search) continue;
+      const route = JSON.parse(app.querySelector('script[data-target="react-app.embeddedData"]')?.textContent ?? '').payload?.pullRequestsChangesRoute;
+      const pr = getPullRequest(document.URL);
+      if (!pr || getPullRequest(route?.pullRequestUrl ?? '')?.key !== pr.key) continue;
+      for (const value of [route.headOid, route.headSha, route.currentHeadOid]) if (typeof value === 'string' && /^[a-f\d]{40,64}$/i.test(value)) return value;
+    } catch {}
+  }
+  return '';
+}
+
+export async function syncGitHubViewed(file: PullRequestFile, reviewed: boolean, signal?: AbortSignal): Promise<boolean> {
+  const route = document.URL.split('#')[0];
+  if (!await import('./github').then(({ navigateToFile }) => navigateToFile(file, document, signal))) return false;
+  const deadline = Date.now() + 3000;
+  do {
+    if (signal?.aborted || document.URL.split('#')[0] !== route) return false;
+    const target = selectedDiff(file, document)?.target;
+    const controls = target ? [...target.querySelectorAll<HTMLElement>('input[type="checkbox"], [role="checkbox"][aria-checked]')].filter(input => {
+      const label = input.getAttribute('aria-label') ?? input.closest('label')?.textContent?.trim() ?? '';
+      return /\bviewed\b/i.test(label) && !input.closest('.js-inline-comments-container, .review-comment, .comment-body') && !input.hasAttribute('disabled');
+    }) : [];
+    if (controls.length === 1) {
+      const input = controls[0];
+      const checked = () => input instanceof HTMLInputElement ? input.checked : input.getAttribute('aria-checked') === 'true';
+      if (checked() !== reviewed) input.click();
+      return checked() === reviewed;
+    }
+    await new Promise<void>(resolve => setTimeout(resolve, 50));
+  } while (Date.now() < deadline);
+  return false;
+}
+
+export async function collectProgressRevision(file: PullRequestFile, document: Document = globalThis.document, signal?: AbortSignal): Promise<string> {
+  const selected = selectedDiff(file, document);
+  if (selected && !selected.target.querySelector(CODE)) {
+    const images = [...selected.target.querySelectorAll<HTMLImageElement>('img[src]')].filter(image => !image.closest(EXCLUDED)).map(image => image.getAttribute('src'));
+    const copy = selected.target.cloneNode(true) as Element; copy.querySelectorAll(EXCLUDED).forEach(element => element.remove());
+    if (images.length && /\.(png|jpe?g|gif|webp|avif|ico|svg)$/i.test(file.path) || /\b(?:Binary file not shown|Binary files differ|Sorry, we cannot display this file)\b/i.test(copy.textContent ?? '')) {
+      return readHeadRevision(document) + ':' + await fingerprint(JSON.stringify([file.path, file.deleted, file.additions, file.deletions, images]));
+    }
+  }
+  const context = await collectReviewContext(file, document, signal);
+  return readHeadRevision(document) + ':' + await fingerprint(context.diff);
 }

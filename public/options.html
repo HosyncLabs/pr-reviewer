@@ -3,14 +3,14 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI settings · PR Reviewer</title>
+  <title>Settings · PR Reviewer</title>
   <link rel="stylesheet" href="options.css">
   <script defer src="options.js"></script>
 </head>
 <body>
   <main>
     <p class="eyebrow">PR Reviewer</p>
-    <h1>AI settings</h1>
+    <h1>Settings</h1>
     <p>Use your API key to review the file you open in a pull request.</p>
     <form id="settings">
       <label for="provider">AI provider</label>
@@ -39,8 +39,27 @@
         <option value="es">Español</option>
       </select>
       <p id="language-hint" class="hint">Use this language for summaries, highlights, and review focus. The extension interface stays in English.</p>
-      <label class="checkbox"><input id="enabled" type="checkbox"> Enable automatic AI when opening files</label>
-      <p class="notice">When enabled, opening a file sends its path and available diff to OpenAI. The diff may be incomplete. OpenAI API charges apply. The extension does not post comments or change your review.</p>
+      <label class="checkbox"><input id="enabled" type="checkbox"> Enable AI reviews</label>
+      <p class="notice" id="ai-privacy">Each analysis sends the selected diff/context, to the selected provider. Automatic analysis and expanded scope are configurable below. The diff may be incomplete. OpenAI API charges apply. The extension does not post comments or change your review.</p>
+      <details open class="settings-section"><summary>Review workflow</summary><div id="workflow-options"></div></details>
+      <details class="settings-section"><summary>Context and consumption limits</summary>
+        <div id="workflow-limits"></div>
+        <label for="github-token">GitHub token (optional)</label>
+        <input id="github-token" type="password" maxlength="512" autocomplete="off" spellcheck="false" placeholder="Leave blank to keep your saved token">
+        <p class="hint" id="github-token-state"></p>
+        <p class="hint">Expanded and module reviews use the GitHub API. Public repositories work without a token. Private repositories need a fine-grained token with Pull requests: read and Contents: read for the source repository, including forks. The token stays in trusted local extension storage; it is not sent to an AI provider.</p>
+        <button id="remove-github-token" type="button">Remove GitHub token</button>
+      </details>
+      <details class="settings-section"><summary>Repository checklist</summary>
+        <label for="checklist-repo">Repository (owner/repo)</label><input id="checklist-repo" type="text" placeholder="acme/example" maxlength="200">
+        <label for="checklist-items">Review criteria · one per line</label><textarea id="checklist-items" rows="6" maxlength="6000" placeholder="Tenant isolation
+Input validation
+Translations
+Regression tests
+Migration rollback"></textarea>
+        <p class="hint">Save a separate checklist for each repository. Enable checklists above to include these criteria in AI reviews and track them manually per file.</p>
+      </details>
+      <details class="settings-section"><summary>Local data</summary><p class="hint">Cached reviews expire after seven days (up to 30 analyses). Progress and notes stay local until cleared. Notes and completion marks are never sent to AI.</p><button id="clear-cache" type="button">Clear cached reviews</button> <button id="clear-progress" type="button">Clear saved progress and notes</button></details>
       <div class="actions">
         <button id="save" type="submit" disabled>Save settings</button>
         <button id="remove-key" type="button" disabled>Remove API key</button>
