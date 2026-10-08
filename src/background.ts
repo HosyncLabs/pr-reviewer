@@ -282,7 +282,7 @@ export async function handleExtensionMessage(message: unknown, sender: chrome.ru
       if (!pr.isFilesPage || !validPath(request.path) || !validRequestId(request.requestId) || !['file', 'module'].includes(String(request.scope)) ||
         !workflow.options.expandedContext || request.scope === 'module' && !workflow.options.moduleReview ||
         !Array.isArray(request.relatedPaths ?? []) || (request.relatedPaths as unknown[] | undefined)?.some(path => !validPath(path)) ||
-        ((request.relatedPaths ?? []) as unknown[]).length > 100) return error('Enable this review scope in Settings first.');
+        ((request.relatedPaths ?? []) as unknown[]).length > 3000) return error('Enable this review scope in Settings first.');
       const url = new URL(sender.url!);
       if (url.search || !/\/(files|changes)\/?$/.test(url.pathname)) return error('Expanded context requires the full PR comparison. Open Files changed without commit filters.');
       if (!await chrome.permissions.contains({ origins: ['https://api.github.com/*'] })) return error('Allow GitHub API access by saving Settings.');

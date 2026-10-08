@@ -166,11 +166,23 @@ test('adds AI comment drafts through native controls and collapses reviewed bloc
   const shadow = await openPanel(current.window);
   (await until(() => links(shadow)[0], 'file link')).click();
   await until(() => shadow.querySelector('.ai-result'), 'AI blocks');
-  assert.equal(shadow.querySelectorAll('.ai-block-actions button').length, 8, 'Both actions appear on Summary, Highlights and Review focus');
+  assert.equal(shadow.querySelectorAll('.ai-block-actions button').length, 11, 'Comment, copy, and review actions appear on every block');
   const button = (block: Element, label: string) => [...block.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === label)!;
   const summary = shadow.querySelector('.ai-summary-card')!;
   const highlight = shadow.querySelector('.ai-highlights .ai-comment')!;
   const focus = shadow.querySelector('.ai-focus .ai-comment')!;
+  const copied: string[] = []; let clipboardDenied = false;
+  Object.defineProperty(current.window.navigator, 'clipboard', { value: { writeText: async (text: string) => {
+    if (clipboardDenied) throw new Error('Clipboard access denied');
+    copied.push(text);
+  } } });
+  const nativeBeforeCopy = nativeFile.innerHTML, hashBeforeCopy = current.window.location.hash;
+  for (const block of [summary, highlight, focus]) {
+    button(block, 'Copy comment').click();
+    await until(() => block.textContent?.includes('Comment copied.'), 'copy generated comment');
+  }
+  assert.deepEqual(copied, ['¿Podemos documentar cuándo se aplica la moneda predeterminada?', '¿Podemos probar una solicitud sin moneda y otra con moneda explícita?', '¿Qué debe ocurrir cuando la moneda es una cadena vacía?']);
+  assert.equal(nativeOpens, 0); assert.equal(nativeFile.innerHTML, nativeBeforeCopy); assert.equal(current.window.location.hash, hashBeforeCopy);
   button(highlight, 'Reviewed').click();
   await until(() => highlight.classList.contains('is-collapsed'), 'Reviewed collapses');
   assert.equal(highlight.classList.contains('is-reviewed'), true);
@@ -195,6 +207,10 @@ test('adds AI comment drafts through native controls and collapses reviewed bloc
   assert.equal(nativeOpens, 1);
   button(focus, 'Add comment').click();
   await until(() => focus.textContent?.includes('Finish or cancel your existing GitHub draft'), 'unrelated draft protection');
+  assert.equal(focus.querySelector('textarea')!.value, '¿Qué debe ocurrir cuando la moneda es una cadena vacía?');
+  assert.equal(editor.value, 'My edited draft');
+  clipboardDenied = true; button(focus, 'Copy comment').click();
+  await until(() => focus.textContent?.includes('Could not access the clipboard'), 'manual copy fallback');
   assert.equal(focus.querySelector('textarea')!.value, '¿Qué debe ocurrir cuando la moneda es una cadena vacía?');
   assert.equal(editor.value, 'My edited draft');
   editor.closest('.js-inline-comments-container')!.remove();
@@ -1453,6 +1469,8 @@ test('manual workflow saves notes and progress, skips reviewed files, dismisses 
     if (message.type === 'ai-review') { calls++; return { ok: true, review: { summary: 'Changes return value.', highlights: [], focus: [{ text: 'Could the input be null?', kind: 'question', severity: 'medium', evidence: 'Input is returned directly.', lines: [{ side: 'right', line: 1 }], suggestion: { line: 1, code: 'return input ?? null;' } }], usage: { input: 100, output: 20, total: 120 } } }; }
   };
   const current = page(undefined, stored, html, handler); t.after(() => current.dom.window.close());
+  const copied: string[] = [];
+  Object.defineProperty(current.window.navigator, 'clipboard', { value: { writeText: async (text: string) => { copied.push(text); } } });
   const shadow = await openPanel(current.window);
   const button = (label: string) => [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === label)!;
   links(shadow)[0].click();
@@ -1465,6 +1483,10 @@ test('manual workflow saves notes and progress, skips reviewed files, dismisses 
   button('Add suggestion').click();
   const editor = await until(() => current.window.document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Markdown value"]')?.value ? current.window.document.querySelector<HTMLTextAreaElement>('textarea[aria-label="Markdown value"]') : null, 'suggestion draft');
   assert.equal(editor.value, '```suggestion\nreturn input ?? null;\n```');
+  await until(() => shadow.querySelector('.ai-focus')!.textContent?.includes('Draft added in GitHub'), 'suggestion ready to copy');
+  [...shadow.querySelectorAll<HTMLButtonElement>('.ai-focus button')].find(button => button.textContent === 'Copy comment')!.click();
+  await until(() => copied.length === 1, 'copy generated suggestion');
+  assert.equal(copied[0], editor.value);
   [...shadow.querySelectorAll<HTMLButtonElement>('.ai-focus button')].find(button => button.textContent === 'Reviewed')!.click(); await until(() => shadow.querySelector('.ai-focus .is-reviewed'), 'reviewed finding');
   const note = shadow.querySelector<HTMLTextAreaElement>('#review-note')!;
   const setter = Object.getOwnPropertyDescriptor(current.window.HTMLTextAreaElement.prototype, 'value')!.set!;
@@ -1513,7 +1535,7 @@ for (const apiContext of [false, true]) test(apiContext ? 'module analysis follo
   const button = (name: string) => [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === name)!;
   button('AI review').click(); await until(() => shadow.querySelector('.module-review-controls'), 'module controls');
   shadow.querySelector<HTMLDetailsElement>('.module-review-controls')!.open = true;
-  const related = shadow.querySelector<HTMLInputElement>('.module-review-controls input')!; related.click(); button('Analyze module').click();
+  const related = shadow.querySelector<HTMLInputElement>('.related-file-list input')!; related.click(); button('Analyze module').click();
   await until(() => shadow.querySelector('.ai-result') || shadow.querySelector('.ai-error'), 'module result'); assert.equal(shadow.querySelector('.ai-error')?.textContent, undefined, JSON.stringify(current.messages)); assert.equal(calls, 1);
   const chip = shadow.querySelector<HTMLAnchorElement>('.ai-line-chip')!;
   assert.equal(chip.getAttribute('href'), `#${anchor(1)}R1`); chip.click();
@@ -1525,6 +1547,40 @@ for (const apiContext of [false, true]) test(apiContext ? 'module analysis follo
     await until(() => shadow.querySelector('.ai-error')?.textContent?.includes('does not match'), 'stale API revision rejection');
     assert.equal(calls, 1, 'A mismatched API context must not be sent to AI');
   }
+  assert.deepEqual(current.errors, []);
+});
+
+test('module Select all handles partial selection and clearing without analyzing until requested, and retains configured limits', async t => {
+  const fixturePaths = ['packages/mira-api/src/order.ts', 'packages/mira-api/src/order.test.ts', 'packages/mira-widgets/src/order.tsx', 'packages/mira-editor/src/order.tsx', 'packages/mira-types/src/order.ts'];
+  let calls = 0;
+  const html = `<a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">5</span></a>${fixturePaths.map((path, index) => `<section id="${anchor(index)}" data-tagsearch-path="${path}"><div class="file-header" data-path="${path}" data-anchor="${anchor(index)}"><a title="${path}" href="#${anchor(index)}">${path}</a></div><table><tr><td class="blob-num" data-line-number="1">1</td><td class="blob-code"><span class="blob-code-inner" data-code-marker="+">return input;</span></td></tr></table></section>`).join('')}`;
+  const current = page(undefined, {}, html, async message => {
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture', language: 'en', options: { ...DEFAULT_WORKFLOW, automatic: false, moduleReview: true, moduleFileLimit: 3 } } };
+    if (message.type === 'ai-review') {
+      calls++; assert.equal(message.context.scope, 'module');
+      assert.deepEqual(Array.from(message.context.related ?? [], file => file.path), fixturePaths.slice(1, 3));
+      assert.equal(message.context.partial, true); assert.match(message.context.warnings![0], /Review limits reached/);
+      return { ok: true, review: { summary: 'Checks the selected files within the limit.', highlights: [], focus: [] } };
+    }
+  }); t.after(() => current.dom.window.close());
+  const shadow = await openPanel(current.window); links(shadow).find(link => link.title === fixturePaths[0])!.click();
+  await until(() => shadow.querySelector('.module-review-controls'), 'module selection controls');
+  shadow.querySelector<HTMLDetailsElement>('.module-review-controls')!.open = true;
+  const all = shadow.querySelector<HTMLInputElement>('.module-select-all input')!;
+  const related = () => [...shadow.querySelectorAll<HTMLInputElement>('.related-file-list input')];
+  assert.equal(related().length, 3); assert.equal(all.checked, false); assert.equal(all.indeterminate, false);
+  all.click(); await until(() => related().every(input => input.checked), 'all related files selected');
+  assert.equal(all.checked, true); assert.equal(all.indeterminate, false);
+  related()[1].click(); await until(() => all.indeterminate, 'partial selection'); assert.equal(all.checked, false);
+  all.click(); await until(() => related().every(input => input.checked), 'select all from partial state');
+  all.click(); await until(() => related().every(input => !input.checked), 'clear all');
+  assert.equal(all.checked, false); assert.equal(all.indeterminate, false);
+  related()[0].click(); await until(() => all.indeterminate, 'individual selection updates select all');
+  all.click(); await until(() => related().every(input => input.checked), 'restore selection');
+  assert.equal(calls, 0, 'Selecting files never starts an AI request');
+  [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === 'Analyze module')!.click();
+  await until(() => shadow.querySelector('.ai-result'), 'selected module result');
+  assert.equal(calls, 1); assert.equal(current.messages.some(message => message.type === 'github-context'), false);
   assert.deepEqual(current.errors, []);
 });
 
@@ -1545,6 +1601,7 @@ for (const scope of ['file', 'module'] as const) test(`${scope} review falls bac
   const shadow = await openPanel(current.window); links(shadow).find(link => link.title === path)!.click();
   const button = (name: string) => [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === name)!;
   button('AI review').click(); await until(() => button('Analyze file'), 'manual analysis ready');
+  assert.equal(shadow.querySelector<HTMLInputElement>('.module-select-all input')!.disabled, true, 'Select all is disabled when there are no related files');
   if (scope === 'module') shadow.querySelector<HTMLDetailsElement>('.module-review-controls')!.open = true;
   button(scope === 'module' ? 'Analyze module' : 'Analyze file').click();
   await until(() => shadow.querySelector('.ai-result'), 'loaded-diff fallback review');

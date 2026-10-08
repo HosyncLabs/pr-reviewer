@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "minimum_chrome_version": "140",
   "name": "PR Reviewer · Organizer",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Organizes GitHub PR files and optionally reviews selected diffs with OpenAI, Gemini, or Claude.",
   "permissions": ["storage"],
   "optional_host_permissions": ["https://api.openai.com/*", "https://generativelanguage.googleapis.com/*", "https://api.anthropic.com/*", "https://api.github.com/*"],

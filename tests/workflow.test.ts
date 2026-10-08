@@ -124,4 +124,13 @@ test('worker persists isolated progress, caches across restart, honors budgets a
   stored['pr-reviewer:workflow'].options.moduleReview = true;
   assert.equal((await message({ type: 'github-context', path: context.path, scope: 'module', requestId: 'loaded-module' })).ok, false, 'Module review does not opt in to the GitHub API');
   assert.equal(requests, 1);
+  stored['pr-reviewer:workflow'].options.expandedContext = true;
+  let contextCalls = 0;
+  globalThis.fetch = async () => { contextCalls++; throw new Error('Fixture GitHub API request reached'); };
+  const relatedPaths = Array.from({ length: 144 }, (_, index) => `packages/feature-${index}/src/index.ts`);
+  const allFiles = await message({ type: 'github-context', path: context.path, scope: 'module', relatedPaths, requestId: 'all-files' });
+  assert.ok(!allFiles.ok); assert.match(allFiles.error, /Fixture GitHub API request reached/);
+  assert.equal(contextCalls, 1, 'A select-all list larger than 100 files reaches the bounded context loader');
+  const oversized = await message({ type: 'github-context', path: context.path, scope: 'module', relatedPaths: Array.from({ length: 3001 }, () => 'src/a.ts'), requestId: 'too-many' });
+  assert.equal(oversized.ok, false); assert.equal(contextCalls, 1, 'Oversized lists are still rejected before fetching');
 });

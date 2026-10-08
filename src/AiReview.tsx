@@ -28,6 +28,7 @@ function ReviewBlock({ item, file, summary = false, jump, addComment, blockState
   const [collapsed, setCollapsed] = useState(reviewed);
   useEffect(() => setCollapsed(reviewed), [reviewed]);
   const [pending, setPending] = useState(false);
+  const [copying, setCopying] = useState(false);
   const [message, setMessage] = useState('');
   const [showDraft, setShowDraft] = useState(false);
   const [shownDraft, setShownDraft] = useState('');
@@ -45,6 +46,19 @@ function ReviewBlock({ item, file, summary = false, jump, addComment, blockState
     if (!mounted.current) return;
     setPending(false); setMessage(result?.message ?? 'Comment cancelled. Try again on the current file.'); setShowDraft(result?.showDraft ?? false);
   };
+  const copyComment = async () => {
+    const generated = shownDraft || draft;
+    setCopying(true);
+    try {
+      await navigator.clipboard.writeText(generated);
+      if (mounted.current) setMessage('Comment copied.');
+    } catch {
+      if (mounted.current) {
+        setShownDraft(generated); setShowDraft(true);
+        setMessage('Could not access the clipboard. Copy the suggested comment below.');
+      }
+    } finally { if (mounted.current) setCopying(false); }
+  };
   const Tag = summary ? 'div' : 'li';
   if (blockState === 'dismissed') return <Tag className="ai-dismissed"><span>Dismissed</span><button onClick={() => onMark(null)}>Undo dismiss</button></Tag>;
   return <Tag className={`${summary ? 'ai-summary-card' : `ai-comment${item.lines.length ? ' has-reference' : ''}`}${reviewed ? ' is-reviewed' : ''}${collapsed ? ' is-collapsed' : ''}`}>
@@ -59,8 +73,9 @@ function ReviewBlock({ item, file, summary = false, jump, addComment, blockState
     </>}
     {options.findingDetails && item.evidence && <p className="finding-evidence"><strong lang="en">Evidence: </strong>{item.evidence}</p>}
     <div className="ai-block-actions" lang="en">
-      <button disabled={pending} onClick={() => void openComment()}>{pending ? 'Opening…' : 'Add comment'}</button>
-      {options.suggestions && item.suggestion && <button disabled={pending} onClick={() => void openComment(true)}>Add suggestion</button>}
+      <button disabled={pending || copying} onClick={() => void openComment()}>{pending ? 'Opening…' : 'Add comment'}</button>
+      <button disabled={pending || copying} onClick={() => void copyComment()}>{copying ? 'Copying…' : 'Copy comment'}</button>
+      {options.suggestions && item.suggestion && <button disabled={pending || copying} onClick={() => void openComment(true)}>Add suggestion</button>}
       <button disabled={pending} aria-pressed={reviewed} onClick={() => { onMark(reviewed ? null : 'reviewed'); setCollapsed(!reviewed); }}>{reviewed ? 'Undo reviewed' : 'Reviewed'}</button>
       {!summary && <button disabled={pending} onClick={() => onMark('dismissed')}>Dismiss</button>}
     </div>
@@ -241,6 +256,8 @@ export function AiReview({ file, files, progress, onProgress, selection, compari
   const mark = (item: AIReviewComment, state: 'reviewed' | 'dismissed' | null) => { if (file) void onProgress({ path: file.path, block: { key: blockIds[blockKey(item)], state } }); };
   const summaryItem: AIReviewComment = { text: review?.summary ?? '', lines: [], suggestedComment: review?.summaryComment };
   const providerLabel = status ? AI_PROVIDERS[status.provider ?? 'openai'].label : 'the selected AI provider';
+  const relatedFiles = file ? files.filter(target => target.path !== file.path && moduleFor(target.path) !== moduleFor(file.path)) : [];
+  const allRelatedSelected = relatedFiles.length > 0 && relatedFiles.every(target => relatedPaths.includes(target.path));
   return <section className="ai-review" hidden={!visible} aria-label="AI review">
     <div className="ai-heading"><h2>AI review</h2><button className="ai-settings-button" onClick={() => void openSettings()}>Settings</button></div>
     {file && <p className="ai-file" title={file.path}>{file.path}</p>}
@@ -253,7 +270,15 @@ export function AiReview({ file, files, progress, onProgress, selection, compari
     {context && <p className={`ai-scope${context.partial ? ' partial' : ''}`}>{context.scope === 'module' ? 'Module analysis' : context.surrounding ? 'Diff + surrounding source' : context.revision ? 'GitHub API diff' : 'Loaded diff analyzed'}{context.partial ? ' · Partial diff' : ''} · {providerLabel} · {status?.model}{status && <> · {AI_LANGUAGE_LABELS[status.language]}</>}</p>}
     {context?.warnings?.map(warning => <p key={warning} className="ai-scope partial">{warning}</p>)}
     {review && <p className="ai-usage">{review.cached ? 'Cached review · no new AI request' : 'New analysis'}{review.usage ? ` · ${review.usage.input.toLocaleString()} input + ${review.usage.output.toLocaleString()} output tokens` : ' · Token usage unavailable'}</p>}
-    {options.moduleReview && file && <details className="module-review-controls"><summary>Module review · {moduleFor(file.path)}</summary><p>Read loaded Changes diffs from this module, plus optional related files below. No GitHub token needed. Missing files and limits are reported; optional API context can add source.</p><div className="related-file-list">{files.filter(target => target.path !== file.path && moduleFor(target.path) !== moduleFor(file.path)).map(target => <label key={target.path}><input type="checkbox" checked={relatedPaths.includes(target.path)} onChange={event => setRelatedPaths(paths => event.target.checked ? [...paths, target.path] : paths.filter(path => path !== target.path))} />{target.path}</label>)}</div><button disabled={phase === 'reading' || phase === 'generating' || !status?.enabled || !status.configured} onClick={() => { setScope('module'); setRequested(selectionKey); setRefresh(value => value + 1); }}>Analyze module</button></details>}
+    {options.moduleReview && file && <details className="module-review-controls">
+      <summary>Module review · {moduleFor(file.path)}</summary>
+      <p>Read loaded Changes diffs from this module, plus optional related files below. No GitHub token needed. Missing files and limits are reported; optional API context can add source.</p>
+      <label className="module-select-all"><input type="checkbox" aria-label="Select all related files" disabled={!relatedFiles.length} checked={allRelatedSelected}
+        ref={element => { if (element) element.indeterminate = !allRelatedSelected && relatedFiles.some(target => relatedPaths.includes(target.path)); }}
+        onChange={event => setRelatedPaths(event.target.checked ? relatedFiles.map(target => target.path) : [])} />Select all files ({relatedFiles.length})</label>
+      <div className="related-file-list">{relatedFiles.map(target => <label key={target.path}><input type="checkbox" checked={relatedPaths.includes(target.path)} onChange={event => setRelatedPaths(paths => event.target.checked ? [...paths, target.path] : paths.filter(path => path !== target.path))} />{target.path}</label>)}</div>
+      <button disabled={phase === 'reading' || phase === 'generating' || !status?.enabled || !status.configured} onClick={() => { setScope('module'); setRequested(selectionKey); setRefresh(value => value + 1); }}>Analyze module</button>
+    </details>}
     {(phase === 'reading' || phase === 'generating') && <p className="ai-loading" role="status">{phase === 'reading' ? 'Reading file changes…' : 'Generating review…'}</p>}
     {error && <p className="ai-error" role="alert">{error}</p>}
     {navigationStatus && <p className="ai-navigation-status" role="status" lang="en">{navigationStatus}</p>}
