@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type MouseEvent } from 'react';
-import { AI_LANGUAGE_LABELS, AI_STATUS_NOTICE, EXTENSION_RELOAD_NOTICE, isAILanguage, sendExtensionMessage, type AIReviewComment, type AIReviewContext, type AIReviewLine, type AIReviewResult, type AIStatus } from './ai-protocol';
+import { AI_LANGUAGE_LABELS, AI_PROVIDERS, AI_STATUS_NOTICE, EXTENSION_RELOAD_NOTICE, isAILanguage, isAIProvider, sendExtensionMessage, type AIReviewComment, type AIReviewContext, type AIReviewLine, type AIReviewResult, type AIStatus } from './ai-protocol';
 import type { PullRequestFile } from './github';
 import { collectReviewContext } from './review-context';
 import { navigateToReviewLine, reviewLineHash } from './review-navigation';
@@ -67,6 +67,7 @@ export function AiReview({ file, selection, comparison, visible, onAutomatic, on
           if (file && response.status.configured && response.status.enabled) onAutomatic();
           throw new Error('Reload PR Reviewer in chrome://extensions, then reload this GitHub tab to apply AI response language settings.');
         }
+        if (response.status.provider !== undefined && !isAIProvider(response.status.provider)) throw new Error('Could not read the selected AI provider. Reload PR Reviewer and this GitHub tab.');
         setStatus(response.status); onStatus(response.status);
         if (!file || !response.status.configured || !response.status.enabled) { automaticSelection.current = ''; return; }
         const selected = JSON.stringify([comparison, file.path, selection]);
@@ -77,7 +78,7 @@ export function AiReview({ file, selection, comparison, visible, onAutomatic, on
         setContext(current); setPhase('generating'); sent = true;
         const result = await sendExtensionMessage({ type: 'ai-review', requestId, context: current });
         if (controller.signal.aborted) return;
-        if (!result.ok || !result.review) throw new Error(result.ok ? 'OpenAI returned an invalid review.' : result.error);
+        if (!result.ok || !result.review) throw new Error(result.ok ? 'The AI provider returned an invalid review.' : result.error);
         if (!hasStructuredComments(result.review)) throw new Error('Reload PR Reviewer in chrome://extensions, then reload this GitHub tab to apply AI line references.');
         setReview(result.review); setPhase('done');
       } catch (cause) {
@@ -117,14 +118,15 @@ export function AiReview({ file, selection, comparison, visible, onAutomatic, on
     setNavigationStatus(found ? '' : 'This line is not loaded. Load or expand its diff in GitHub, then try again.');
   };
 
+  const providerLabel = status ? AI_PROVIDERS[status.provider ?? 'openai'].label : 'the selected AI provider';
   return <section className="ai-review" hidden={!visible} aria-label="AI review">
     <div className="ai-heading"><h2>AI review</h2><button className="ai-settings-button" onClick={() => void openSettings()}>AI settings</button></div>
     {file && <p className="ai-file" title={file.path}>{file.path}</p>}
     {!status && phase !== 'error' && <p role="status">Loading AI settings…</p>}
-    {status && !status.configured && <p>Add your OpenAI API key in AI settings to get highlights when you open a file.</p>}
+    {status && !status.configured && <p>Choose a provider and add its API key in AI settings to get highlights when you open a file.</p>}
     {status?.configured && !status.enabled && <p>Automatic AI is off. Enable it in AI settings.</p>}
     {status?.configured && status.enabled && !file && <p>Open a file from the list or GitHub's file tree to see its highlights and review focus.</p>}
-    {context && <p className={`ai-scope${context.partial ? ' partial' : ''}`}>{context.partial ? 'Partial diff · only loaded lines were analyzed' : 'Loaded diff analyzed'} · {status?.model}{status && <> · {AI_LANGUAGE_LABELS[status.language]}</>}</p>}
+    {context && <p className={`ai-scope${context.partial ? ' partial' : ''}`}>{context.partial ? 'Partial diff · only loaded lines were analyzed' : 'Loaded diff analyzed'} · {providerLabel} · {status?.model}{status && <> · {AI_LANGUAGE_LABELS[status.language]}</>}</p>}
     {(phase === 'reading' || phase === 'generating') && <p className="ai-loading" role="status">{phase === 'reading' ? 'Reading file changes…' : 'Generating review…'}</p>}
     {error && <p className="ai-error" role="alert">{error}</p>}
     {navigationStatus && <p className="ai-navigation-status" role="status" lang="en">{navigationStatus}</p>}
@@ -141,6 +143,6 @@ export function AiReview({ file, selection, comparison, visible, onAutomatic, on
         {review.focus.length ? reviewComments(review.focus, file, (event, reference) => void jump(event, reference)) : <p lang="en">No specific focus points identified in the loaded diff.</p>}
       </section>
     </div>}
-    <p className="ai-disclosure">Only this file's loaded diff is sent to OpenAI. API usage is billed to your OpenAI account.</p>
+    <p className="ai-disclosure">Only this file's loaded diff is sent to {providerLabel}. API usage is billed to your provider account.</p>
   </section>;
 }

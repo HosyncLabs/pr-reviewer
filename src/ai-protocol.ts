@@ -1,8 +1,24 @@
 import type { Category, ImplementationGroup } from './classifier';
 import type { RepositoryPreferences } from './storage';
 
-export const CONTENT_VERSION = '0.1.4';
+export const CONTENT_VERSION = '0.2.0';
 export const DEFAULT_AI_MODEL = 'gpt-6-luna';
+export type AIProvider = 'openai' | 'gemini' | 'claude';
+export const isAIProvider = (value: unknown): value is AIProvider => value === 'openai' || value === 'gemini' || value === 'claude';
+export const AI_PROVIDERS: Record<AIProvider, { label: string; origin: string; defaultModel: string; models: string[]; keyUrl: string }> = {
+  openai: {
+    label: 'OpenAI', origin: 'https://api.openai.com/*', defaultModel: DEFAULT_AI_MODEL,
+    models: [DEFAULT_AI_MODEL, 'gpt-6.1-sol', 'gpt-6-astra'], keyUrl: 'https://platform.openai.com/api-keys',
+  },
+  gemini: {
+    label: 'Gemini', origin: 'https://generativelanguage.googleapis.com/*', defaultModel: 'gemini-3.8-flash',
+    models: ['gemini-3.8-flash', 'gemini-3.1-pro-preview'], keyUrl: 'https://aistudio.google.com/apikey',
+  },
+  claude: {
+    label: 'Claude', origin: 'https://api.anthropic.com/*', defaultModel: 'claude-sonnet-5-5',
+    models: ['claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-opus-5-5'], keyUrl: 'https://platform.claude.com/settings/keys',
+  },
+};
 export type AILanguage = 'en' | 'es';
 export const DEFAULT_AI_LANGUAGE: AILanguage = 'en';
 export const AI_LANGUAGE_LABELS: Record<AILanguage, string> = { en: 'English', es: 'Español' };
@@ -10,13 +26,11 @@ export const isAILanguage = (value: unknown): value is AILanguage => value === '
 export const AI_STATUS_NOTICE = 'pr-reviewer:ai-status-change';
 export const PREFERENCES_NOTICE = 'pr-reviewer:preferences-change';
 export const EXTENSION_RELOAD_NOTICE = 'PR Reviewer was updated or reloaded. Reload this GitHub tab to reconnect.';
-export const OPENAI_ORIGIN = 'https://api.openai.com/*';
-
 export type AIReviewContext = { path: string; diff: string; partial: boolean };
 export type AIReviewLine = { side: 'left' | 'right'; line: number };
 export type AIReviewComment = { text: string; lines: AIReviewLine[] };
 export type AIReviewResult = { summary: string; highlights: AIReviewComment[]; focus: AIReviewComment[] };
-export type AIStatus = { configured: boolean; enabled: boolean; model: string; language: AILanguage };
+export type AIStatus = { configured: boolean; enabled: boolean; model: string; language: AILanguage; provider?: AIProvider };
 
 export type ExtensionRequest =
   | { type: 'ai-status' }

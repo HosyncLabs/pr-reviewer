@@ -214,7 +214,7 @@ export function Panel({ pr, files, expected, comparison }: Snapshot) {
         <AiReview file={files.find(file => file.path === selected)} selection={selection} comparison={comparison} visible={view === 'ai'} onAutomatic={openAutomaticReview} onStatus={setAIStatus} />
       </>}
       {error && <p className="error" role="alert">{error}</p>}
-      <footer><div className="privacy"><span aria-hidden="true">◉</span> Local grouping · OpenAI review optional</div><button className="return-button" onClick={close}>Return to original view <span aria-hidden="true">↗</span></button></footer>
+      <footer><div className="privacy"><span aria-hidden="true">◉</span> Local grouping · AI review optional</div><button className="return-button" onClick={close}>Return to original view <span aria-hidden="true">↗</span></button></footer>
     </aside>}
   </div>;
 }

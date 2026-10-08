@@ -1,5 +1,5 @@
 import { isCategory, isImplementationGroup, type Category, type ClassificationRule, type ImplementationGroup } from './classifier';
-import { AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE, isAILanguage, sendExtensionMessage, type AILanguage, type ExtensionRequest } from './ai-protocol';
+import { AI_PROVIDERS, AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, PREFERENCES_NOTICE, isAILanguage, isAIProvider, sendExtensionMessage, type AILanguage, type AIProvider, type ExtensionRequest } from './ai-protocol';
 
 export type RepositoryPreferences = {
   overrides: Record<string, Category>;
@@ -11,7 +11,8 @@ const overridePrefix = (repository: string) => `${preferenceKey(repository)}:fil
 const implementationPrefix = (repository: string) => `${preferenceKey(repository)}:implementation:`;
 
 const AI_SETTINGS_KEY = 'pr-reviewer:ai-settings';
-export type AISettings = { apiKey: string; enabled: boolean; model: string; language: AILanguage };
+export type AIProviderSettings = { apiKey: string; model: string };
+export type AISettings = AIProviderSettings & { provider: AIProvider; providers: Record<AIProvider, AIProviderSettings>; enabled: boolean; language: AILanguage };
 let accessReady: Promise<void> | undefined;
 
 /** Only extension pages and the worker may call these trusted storage helpers. */
@@ -88,28 +89,46 @@ export async function loadAISettings(): Promise<AISettings> {
   await secureStorage();
   const value = (await chrome.storage.local.get(AI_SETTINGS_KEY))[AI_SETTINGS_KEY];
   const stored = value && typeof value === 'object' ? value as Record<string, unknown> : {};
-  const apiKey = typeof stored?.apiKey === 'string' && stored.apiKey.length <= 512 ? stored.apiKey : '';
-  const model = typeof stored?.model === 'string' && /^[a-z\d][a-z\d._:-]{0,99}$/i.test(stored.model) ? stored.model : DEFAULT_AI_MODEL;
+  const rawProfiles = stored.providers && typeof stored.providers === 'object' ? stored.providers as Record<string, unknown> : {};
+  const providers = Object.fromEntries((Object.keys(AI_PROVIDERS) as AIProvider[]).map(provider => {
+    const raw = rawProfiles[provider];
+    // Legacy flat credentials belong to OpenAI, regardless of the selected provider.
+    const profile = raw && typeof raw === 'object' ? raw as Record<string, unknown> : provider === 'openai' ? stored : {};
+    const apiKey = typeof profile.apiKey === 'string' && profile.apiKey.length <= 512 ? profile.apiKey : '';
+    const model = typeof profile.model === 'string' && /^[a-z\d][a-z\d._:-]{0,99}$/i.test(profile.model) ? profile.model : AI_PROVIDERS[provider].defaultModel;
+    return [provider, { apiKey, model }];
+  })) as Record<AIProvider, AIProviderSettings>;
+  const provider = isAIProvider(stored.provider) ? stored.provider : 'openai';
   const language = isAILanguage(stored.language) ? stored.language : DEFAULT_AI_LANGUAGE;
-  return { apiKey, model, language, enabled: stored?.enabled === true && !!apiKey };
+  return { ...providers[provider], provider, providers, language, enabled: stored.enabled === true && !!providers[provider].apiKey };
 }
 
-export async function saveAISettings(input: { apiKey?: string; enabled: boolean; model: string; language?: AILanguage }): Promise<void> {
+export async function saveAISettings(input: { provider?: AIProvider; apiKey?: string; enabled: boolean; model: string; language?: AILanguage }): Promise<void> {
+  if (input.provider !== undefined && !isAIProvider(input.provider)) throw new Error('Choose OpenAI, Gemini, or Claude.');
   if (input.language !== undefined && !isAILanguage(input.language)) throw new Error('Choose English or Spanish for AI responses.');
   const current = await loadAISettings();
-  const apiKey = input.apiKey === undefined ? current.apiKey : input.apiKey.trim();
-  const model = input.model.trim() || DEFAULT_AI_MODEL;
+  const provider = input.provider ?? current.provider;
+  const apiKey = input.apiKey?.trim() || current.providers[provider].apiKey;
+  const model = input.model.trim() || AI_PROVIDERS[provider].defaultModel;
   const language = input.language ?? current.language;
   if (apiKey.length > 512) throw new Error('The API key is too long.');
-  if (!/^[a-z\d][a-z\d._:-]{0,99}$/i.test(model)) throw new Error('Enter a valid OpenAI model name.');
+  if (!/^[a-z\d][a-z\d._:-]{0,99}$/i.test(model)) throw new Error(`Enter a valid ${AI_PROVIDERS[provider].label} model name.`);
   if (input.enabled && !apiKey) throw new Error('Add an API key before enabling AI.');
-  await chrome.storage.local.set({ [AI_SETTINGS_KEY]: { apiKey, model, language, enabled: input.enabled && !!apiKey } });
+  const providers = { ...current.providers, [provider]: { apiKey, model } };
+  await chrome.storage.local.set({ [AI_SETTINGS_KEY]: { provider, providers, language, enabled: input.enabled && !!apiKey } });
   await chrome.storage.session.set({ [AI_STATUS_NOTICE]: { nonce: crypto.randomUUID() } });
 }
 
-export async function removeAIKey(): Promise<void> {
-  const { model } = await loadAISettings();
-  await saveAISettings({ apiKey: '', enabled: false, model });
+export async function removeAIKey(provider?: AIProvider): Promise<void> {
+  if (provider !== undefined && !isAIProvider(provider)) throw new Error('Choose OpenAI, Gemini, or Claude.');
+  const current = await loadAISettings();
+  const selected = provider ?? current.provider;
+  const providers = { ...current.providers, [selected]: { ...current.providers[selected], apiKey: '' } };
+  await chrome.storage.local.set({ [AI_SETTINGS_KEY]: {
+    provider: current.provider, providers, language: current.language,
+    enabled: selected === current.provider ? false : current.enabled,
+  } });
+  await chrome.storage.session.set({ [AI_STATUS_NOTICE]: { nonce: crypto.randomUUID() } });
 }
 
 export const isAISettingsChange = (changes: Record<string, chrome.storage.StorageChange>) => Object.hasOwn(changes, AI_SETTINGS_KEY);

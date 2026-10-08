@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
 import { JSDOM, VirtualConsole } from 'jsdom';
-import { AI_STATUS_NOTICE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE, type AILanguage, type ExtensionRequest, type ExtensionResponse } from '../src/ai-protocol';
+import { AI_PROVIDERS, AI_STATUS_NOTICE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE, type AILanguage, type AIProvider, type ExtensionRequest, type ExtensionResponse } from '../src/ai-protocol';
 import { isCategory, isImplementationGroup, type Category, type ClassificationRule, type ImplementationGroup } from '../src/classifier';
 import type { RepositoryPreferences } from '../src/storage';
 
@@ -895,6 +895,7 @@ test('reviews only the selected diff through the background bridge and ignores a
   const fixturePaths = ['src/alpha.ts', 'src/beta.ts'];
   const secret = 'TEST_KEY_NOT_FOR_PAGE';
   let responseLanguage: AILanguage = 'en';
+  let responseProvider: AIProvider = 'openai';
   const scrolled: Element[] = [];
   const pending = new Map<string, { requestId: string; resolve: (response: ExtensionResponse) => void }>();
   const html = `
@@ -906,7 +907,7 @@ test('reviews only the selected diff through the background bridge and ignores a
       </div>`).join('')}</main>
     <textarea aria-label="Review comment">PRIVATE_REVIEW_DRAFT</textarea><input type="checkbox" aria-label="Viewed" checked>`;
   const current = page(undefined, { 'private-ai-settings': { apiKey: secret } }, html, message => {
-    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture-model', language: responseLanguage } };
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture-model', language: responseLanguage, provider: responseProvider } };
     if (message.type === 'ai-review') return new Promise(resolve => pending.set(message.context.path, { requestId: message.requestId, resolve }));
   }, window => {
     window.HTMLElement.prototype.scrollIntoView = function () { scrolled.push(this); };
@@ -998,6 +999,7 @@ test('reviews only the selected diff through the background bridge and ignores a
   const requestsBeforeNavigation = current.messages.filter(message => message.type === 'ai-review').length;
   const verifyNavigation = async (link: HTMLAnchorElement, side: 'L' | 'R', line: number) => {
     const beforeScroll = scrolled.length;
+    const summaryBeforeNavigation = shadow.querySelector('.ai-summary')?.textContent;
     link.click();
     await until(() => current.window.location.hash === `#${anchor(1)}${side}${line}` && scrolled.length > beforeScroll, `AI reference navigation to ${side}${line}`);
     const row = current.window.document.getElementById(`${anchor(1)}${side}${line}`)!.closest('tr')!;
@@ -1005,7 +1007,7 @@ test('reviews only the selected diff through the background bridge and ignores a
     assert.strictEqual(shadow.querySelector('aside'), panel);
     assert.equal(aiView.hidden, false);
     assert.equal(aiView.scrollTop, 123);
-    assert.equal(shadow.querySelector('.ai-summary')?.textContent, 'Current beta summary');
+    assert.equal(shadow.querySelector('.ai-summary')?.textContent, summaryBeforeNavigation);
     assert.equal(draft.value, 'PRIVATE_REVIEW_DRAFT');
     assert.equal(viewed.checked, true);
   };
@@ -1102,6 +1104,22 @@ test('reviews only the selected diff through the background bridge and ignores a
   assert.equal(shadow.querySelector('.ai-review h2')?.textContent, 'AI review');
   assert.deepEqual([...shadow.querySelectorAll('.ai-highlights h3, .ai-focus h3')].map(heading => heading.textContent), ['Highlights', 'Review focus']);
   assert.equal(shadow.querySelector('.ai-result')?.textContent?.includes('Stale English'), false);
+  for (const provider of ['gemini', 'claude'] as const) {
+    const previous = pending.get(fixturePaths[1])!;
+    responseProvider = provider;
+    current.notifyAI();
+    const next = await until(() => {
+      const request = pending.get(fixturePaths[1]);
+      return request?.requestId !== previous.requestId ? request : null;
+    }, `${provider} review refresh`);
+    assert.equal(shadow.querySelector('.ai-result'), null, 'Changing providers clears the previous review');
+    next.resolve({ ok: true, review: { summary: `${provider} result`, highlights: [reviewComment('Cambio con referencia')], focus: [] } });
+    await until(() => shadow.querySelector('.ai-summary')?.textContent === `${provider} result`, `${provider} result rendered`);
+    assert.ok(shadow.querySelector('.ai-scope')?.textContent?.includes(AI_PROVIDERS[provider].label));
+    assert.ok(shadow.querySelector('.ai-disclosure')?.textContent?.includes(`sent to ${AI_PROVIDERS[provider].label}`));
+    assert.equal(shadow.querySelector('.ai-result')?.getAttribute('lang'), 'es');
+    await verifyNavigation(shadow.querySelector<HTMLAnchorElement>('.ai-highlights a.ai-line-chip')!, 'R', 1);
+  }
   assert.equal(JSON.stringify(current.messages).includes(secret), false);
   assert.equal(JSON.stringify(current.messages).includes('PRIVATE_REVIEW_DRAFT'), false);
   assert.equal(native.innerHTML, nativeHTML);

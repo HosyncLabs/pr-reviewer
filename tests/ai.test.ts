@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE } from '../src/ai-protocol.ts';
+import { AI_PROVIDERS, AI_STATUS_NOTICE, DEFAULT_AI_LANGUAGE, DEFAULT_AI_MODEL, PREFERENCES_NOTICE, type AIProvider } from '../src/ai-protocol.ts';
 
 const sender: chrome.runtime.MessageSender = { id: 'reviewer-extension', frameId: 0, tab: { id: 7 } as chrome.tabs.Tab, url: 'https://github.com/owner/repo/pull/1/files' };
 const context = { path: 'backend/api/service.ts', diff: '@@ -7,2 +7,3 @@\n[old line 7] -old\n[new line 7] +new\n[old line 8] -oldOnly\n[new line 9] +newOnly\n[new line 10]  context\n+unverified [new line 999] +literal', partial: false };
@@ -17,7 +17,7 @@ const until = async (condition: () => boolean) => {
   assert.fail('Worker did not reach the expected state.');
 };
 
-test('AI worker protects credentials, scopes preferences, bounds requests, caches comparisons, and cancels stale reviews', async t => {
+test('AI worker protects credentials, scopes preferences, isolates providers, bounds requests, caches comparisons, and cancels stale reviews', async t => {
   const originalChrome = Object.getOwnPropertyDescriptor(globalThis, 'chrome');
   const originalFetch = globalThis.fetch;
   t.after(() => {
@@ -35,6 +35,7 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
   let locked = false;
   let writes = 0;
   let permission = true;
+  const permissionRequests: string[][] = [];
   let opened = false;
   const changes = (items: Record<string, unknown>, area: string) => {
     const payload = Object.fromEntries(Object.entries(items).map(([name, newValue]) => [name, { newValue }]));
@@ -42,7 +43,7 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
   };
   Object.defineProperty(globalThis, 'chrome', { configurable: true, value: {
     runtime: { id: sender.id, onMessage: { addListener() {} }, openOptionsPage: async () => { opened = true; } },
-    permissions: { contains: async () => permission },
+    permissions: { contains: async (request: { origins: string[] }) => { permissionRequests.push(request.origins); return permission; } },
     storage: {
       local: {
         setAccessLevel: async (value: { accessLevel: string }) => { assert.equal(value.accessLevel, 'TRUSTED_CONTEXTS'); locked = true; },
@@ -60,11 +61,11 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
   const { handleExtensionMessage, parseAIReview } = await import('../src/background.ts');
   const { loadAISettings, saveAISettings, subscribePreferences, removeAIKey } = await import('../src/storage.ts');
   const call = (message: unknown, from = sender) => handleExtensionMessage(message, from);
-  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: DEFAULT_AI_LANGUAGE } });
+  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: DEFAULT_AI_LANGUAGE, provider: 'openai' } });
   const legacy = stored['pr-reviewer:ai-settings'];
   stored['pr-reviewer:ai-settings'] = { ...(legacy as object), language: 'fr' };
   assert.equal((await loadAISettings()).language, 'en', 'Invalid saved languages fall back to English');
-  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: 'en' } });
+  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: true, enabled: true, model: DEFAULT_AI_MODEL, language: 'en', provider: 'openai' } });
   stored['pr-reviewer:ai-settings'] = legacy;
   const beforeInvalidLanguage = writes;
   await assert.rejects(saveAISettings({ enabled: true, model: DEFAULT_AI_MODEL, language: 'fr' as never }), /Choose English or Spanish/);
@@ -86,12 +87,13 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
   await call({ type: 'ai-open-settings' });
   assert.ok(opened);
 
-  const requests: { url: string; body: Record<string, any>; signal: AbortSignal }[] = [];
+  const requests: { url: string; body: Record<string, any>; signal: AbortSignal; headers: Record<string, string> }[] = [];
   globalThis.fetch = async (url, init) => {
     assert.equal(init?.method, 'POST');
+    assert.equal(init.redirect, 'error');
     assert.equal((init?.headers as Record<string, string>).Authorization, `Bearer ${key}`);
     const body = JSON.parse(init!.body as string);
-    requests.push({ url: String(url), body, signal: init!.signal! });
+    requests.push({ url: String(url), body, signal: init!.signal!, headers: init!.headers as Record<string, string> });
     const data = body.instructions.includes('string values in Spanish')
       ? { output_text: JSON.stringify({ summary: 'Cambia el servicio.', highlights: [{ text: 'Reemplaza el comportamiento anterior.', lines: [{ side: 'right', line: 7 }] }], focus: [{ text: 'Verifica la compatibilidad.', lines: [] }] }) }
       : responseData;
@@ -179,6 +181,148 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
     assert.equal(JSON.stringify(result).includes(key), false);
     assert.match(!result.ok ? result.error : '', status === 401 ? /API key/ : /quota/);
   }
+
+  const reviewText = responseData.output[0].content[0].text;
+  const providerResponse = (provider: AIProvider) => provider === 'gemini'
+    ? { candidates: [{ finishReason: 'STOP', content: { role: 'model', parts: [{ thought: true, text: '{"summary":"Not the review"}' }, { text: reviewText }] } }] }
+    : provider === 'claude'
+      ? { type: 'message', role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'thinking', thinking: 'Not the review' }, { type: 'text', text: reviewText }] }
+      : responseData;
+  for (const provider of ['gemini', 'claude'] as const) {
+    const profileKey = `${provider}-test-only-key-placeholder`;
+    const model = AI_PROVIDERS[provider].defaultModel;
+    await saveAISettings({ provider, apiKey: profileKey, enabled: true, model, language: 'es' });
+    await saveAISettings({ provider, apiKey: '   ', enabled: true, model });
+    assert.equal((await loadAISettings()).apiKey, profileKey, 'A blank direct settings save preserves the selected provider key');
+    const status = await call({ type: 'ai-status' });
+    assert.deepEqual(status, { ok: true, status: { configured: true, enabled: true, model, language: 'es', provider } });
+    assert.equal(JSON.stringify(status).includes(profileKey), false);
+    let envelope: unknown = providerResponse(provider);
+    globalThis.fetch = async (url, init) => {
+      assert.equal(init?.method, 'POST');
+      assert.equal(init.redirect, 'error');
+      requests.push({ url: String(url), body: JSON.parse(init!.body as string), signal: init!.signal!, headers: init!.headers as Record<string, string> });
+      return new Response(JSON.stringify(envelope), { status: 200 });
+    };
+    const before: number = requests.length;
+    const result = await call(reviewMessage(`${provider}-review`));
+    assert.deepEqual(result, reviewed, 'Every provider uses the same exact-line whitelist, including distinct old/new numbers');
+    assert.deepEqual(permissionRequests.at(-1), [AI_PROVIDERS[provider].origin]);
+    const request = requests.at(-1)!;
+    assert.equal(request.headers['Content-Type'], 'application/json');
+    assert.equal(request.headers.Authorization, undefined, 'Other providers must not receive the OpenAI credential header');
+    assert.equal(JSON.stringify(request.body).includes(profileKey), false, 'Credentials belong only in headers');
+    if (provider === 'gemini') {
+      assert.equal(request.url, `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`);
+      assert.equal(request.headers['x-goog-api-key'], profileKey);
+      assert.equal(request.headers['x-api-key'], undefined);
+      assert.match(request.body.systemInstruction.parts[0].text, /string values in Spanish/);
+      assert.deepEqual(JSON.parse(request.body.contents[0].parts[0].text), context);
+      assert.equal(request.body.contents[0].role, 'user');
+      assert.equal(request.body.generationConfig.maxOutputTokens, 4000);
+      assert.equal(request.body.generationConfig.responseFormat.text.mimeType, 'application/json');
+      assert.deepEqual(request.body.generationConfig.responseFormat.text.schema, schema);
+      assert.equal(request.body.generationConfig.responseMimeType, undefined);
+      assert.equal(request.body.generationConfig.responseJsonSchema, undefined);
+    } else {
+      assert.equal(request.url, 'https://api.anthropic.com/v1/messages');
+      assert.equal(request.headers['x-api-key'], profileKey);
+      assert.equal(request.headers['x-goog-api-key'], undefined);
+      assert.equal(request.headers['anthropic-version'], '2023-06-01');
+      assert.equal(request.headers['anthropic-dangerous-direct-browser-access'], 'true');
+      assert.equal(request.body.model, model);
+      assert.equal(request.body.max_tokens, 4000);
+      assert.match(request.body.system, /string values in Spanish/);
+      assert.deepEqual(JSON.parse(request.body.messages[0].content), context);
+      assert.equal(request.body.messages[0].role, 'user');
+      assert.equal(request.body.output_config.format.type, 'json_schema');
+      const transport = request.body.output_config.format.schema;
+      assert.equal(transport.additionalProperties, false);
+      assert.deepEqual(transport.required, ['summary', 'highlights', 'focus']);
+      for (const name of ['highlights', 'focus']) {
+        assert.equal(transport.properties[name].maxItems, undefined);
+        assert.equal(transport.properties[name].items.additionalProperties, false);
+        const lines = transport.properties[name].items.properties.lines;
+        assert.equal(lines.maxItems, undefined);
+        assert.deepEqual(lines.items.properties.line, { type: 'integer' });
+        assert.equal(lines.items.additionalProperties, false);
+      }
+    }
+    await call(reviewMessage(`${provider}-cached`));
+    assert.equal(requests.length, before + 1, 'Completed reviews reuse only the selected provider cache');
+    const badEnvelopes: unknown[] = provider === 'gemini' ? [
+      { candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [{ text: reviewText }] } }] },
+      { candidates: [{ finishReason: 'SAFETY', content: { parts: [{ text: reviewText }] } }] },
+      { promptFeedback: { blockReason: 'SAFETY' }, ...providerResponse(provider) },
+      { candidates: [{ finishReason: 'STOP', content: { parts: [{ thought: true, text: reviewText }] } }] },
+      { candidates: [{ finishReason: 'STOP', content: { parts: [{ text: '{broken' }] } }] },
+      { candidates: [{ finishReason: 'STOP', content: { parts: [null, { text: reviewText }] } }] },
+      { candidates: [{ finishReason: 'STOP', content: { role: 'user', parts: [{ text: reviewText }] } }] },
+      { candidates: [] },
+    ] : [
+      { ...providerResponse(provider), stop_reason: 'max_tokens' },
+      { ...providerResponse(provider), stop_reason: 'refusal' },
+      { ...providerResponse(provider), stop_reason: 'model_context_window_exceeded' },
+      { ...providerResponse(provider), content: [{ type: 'refusal', text: reviewText }] },
+      { ...providerResponse(provider), content: [{ type: 'thinking', thinking: reviewText }] },
+      { ...providerResponse(provider), content: [{ type: 'text', text: '{broken' }] },
+      { ...providerResponse(provider), role: 'user' },
+    ];
+    for (const [index, bad] of badEnvelopes.entries()) {
+      envelope = bad;
+      const result = await call(reviewMessage(`${provider}-bad-${index}`, { diff: `${context.diff}\n${provider} envelope ${index}` }));
+      assert.match(!result.ok ? result.error : '', new RegExp(`${AI_PROVIDERS[provider].label} returned an incomplete or unexpected review`));
+    }
+    for (const httpStatus of [400, 401, 403, 404, 429, 503]) {
+      let attempts = 0;
+      globalThis.fetch = async url => {
+        attempts++;
+        assert.equal(new URL(String(url)).origin, new URL(AI_PROVIDERS[provider].origin).origin, 'Failures must never fall back to another provider');
+        return { ok: false, status: httpStatus, json: () => assert.fail('Raw API errors must not be read or exposed') } as unknown as Response;
+      };
+      const result = await call(reviewMessage(`${provider}-http-${httpStatus}`, { diff: `${context.diff}\n${provider} error ${httpStatus}` }));
+      assert.equal(result.ok, false);
+      assert.match(!result.ok ? result.error : '', new RegExp(AI_PROVIDERS[provider].label));
+      assert.equal(JSON.stringify(result).includes(profileKey), false);
+      assert.equal(attempts, 1);
+    }
+    permission = false;
+    globalThis.fetch = async () => { assert.fail('Denied provider permission must prevent fetching'); };
+    assert.match(JSON.stringify(await call(reviewMessage(`${provider}-permission`))), new RegExp(`Allow access to ${AI_PROVIDERS[provider].label}`));
+    assert.deepEqual(permissionRequests.at(-1), [AI_PROVIDERS[provider].origin]);
+    permission = true;
+    await removeAIKey(provider);
+    assert.match(JSON.stringify(await call(reviewMessage(`${provider}-missing-key`))), new RegExp(`Add your ${AI_PROVIDERS[provider].label} API key`));
+    await saveAISettings({ provider, apiKey: profileKey, enabled: true, model });
+  }
+
+  // Keep the same model and input while switching without a storage event to isolate the cache's provider component.
+  const profiles = (await loadAISettings()).providers;
+  let selectedProvider: AIProvider = 'openai';
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), body: JSON.parse(init!.body as string), signal: init!.signal!, headers: init!.headers as Record<string, string> });
+    return new Response(JSON.stringify(providerResponse(selectedProvider)), { status: 200 });
+  };
+  const beforeProviderCache = requests.length;
+  for (const provider of ['openai', 'gemini', 'claude', 'openai'] as const) {
+    selectedProvider = provider;
+    stored['pr-reviewer:ai-settings'] = { provider, enabled: true, language: 'en', providers: Object.fromEntries(Object.entries(profiles).map(([name, profile]) => [name, { ...profile, model: 'shared-test-model' }])) };
+    assert.equal((await call(reviewMessage(`${provider}-cache-scope`, { path: 'provider-cache.ts' }))).ok, true);
+  }
+  assert.equal(requests.length, beforeProviderCache + 3, 'Identical model/input across providers stay isolated, while returning to one provider reuses its own review');
+
+  await saveAISettings({ provider: 'gemini', enabled: true, model: AI_PROVIDERS.gemini.defaultModel });
+  let settingsSignal: AbortSignal | null = null;
+  globalThis.fetch = async (_url, init) => new Promise<Response>((_resolve, reject) => {
+    settingsSignal = init!.signal!;
+    settingsSignal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true });
+  });
+  const changingProvider = call(reviewMessage('settings-cancel', { diff: 'pending provider review' }));
+  await until(() => !!settingsSignal);
+  await saveAISettings({ provider: 'openai', enabled: true, model: DEFAULT_AI_MODEL, language: 'es' });
+  assert.deepEqual(await changingProvider, { ok: false, error: 'Analysis canceled.' }, 'Changing provider aborts the previous provider request');
+  assert.ok((settingsSignal as unknown as AbortSignal).aborted);
+
   await saveAISettings({ enabled: false, model: DEFAULT_AI_MODEL });
   assert.deepEqual(Object.keys(notices[AI_STATUS_NOTICE] as object), ['nonce']);
   assert.deepEqual(await call(reviewMessage('disabled')), { ok: false, error: 'AI is disabled. Enable it in AI settings.' });
@@ -186,9 +330,11 @@ test('AI worker protects credentials, scopes preferences, bounds requests, cache
   permission = false;
   assert.match(JSON.stringify(await call(reviewMessage('permission'))), /Allow access to OpenAI/);
   await removeAIKey();
-  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: false, enabled: false, model: DEFAULT_AI_MODEL, language: 'es' } });
+  assert.deepEqual(await call({ type: 'ai-status' }), { ok: true, status: { configured: false, enabled: false, model: DEFAULT_AI_MODEL, language: 'es', provider: 'openai' } });
   assert.equal(parseAIReview({ ...responseData, status: 'incomplete' }), null);
   assert.equal(parseAIReview({ output: [{ type: 'message', content: [null, { type: 'refusal', refusal: 'No review' }] }] }), null);
+  assert.equal(parseAIReview({ ...responseData, output_text: reviewText, output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'No review' }] }] }, context.diff), null, 'A refusal cannot be bypassed by a second text field');
+  assert.equal(parseAIReview({ ...responseData, status: 'in_progress' }, context.diff), null);
   assert.equal(parseAIReview({ output_text: '{"summary":"x","highlights":[1],"focus":[]}' }), null);
   assert.equal(parseAIReview({ output_text: '{"summary":"x","highlights":["legacy string"],"focus":[]}' }, context.diff), null, 'Old string arrays must not reach the line-comment UI');
   for (const malformed of [null, { text: 1, lines: [] }, { text: 'x', lines: '7' }]) {
