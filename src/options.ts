@@ -26,8 +26,8 @@ const optionLabels: Record<string, [string, string]> = {
   suggestions: ['Enable Add suggestion', 'Open an editable GitHub suggestion for a verified single changed line.'],
   checklist: ['Enable repository checklists', 'Track your criteria per file and include them in AI instructions.'],
   automatic: ['Analyze automatically when opening files', 'Turn off to generate reviews only when you press Analyze file.'],
-  expandedContext: ['Use GitHub API diff and surrounding source', 'Opt in to sending more code to the selected AI provider, bounded by the limits below.'],
-  moduleReview: ['Enable module review', 'Show a manual Analyze module action and optional related-file selection across packages.'],
+  expandedContext: ['Use GitHub API diff and surrounding source', 'Optional: add API patches and nearby source. If access fails, use loaded Changes diffs. Leave off to review without a GitHub token.'],
+  moduleReview: ['Enable module review', 'Analyze loaded Changes diffs in a module and optional related files across packages, without a GitHub token.'],
   cacheReviews: ['Cache AI reviews locally', 'Reuse identical provider/model/language/context reviews across reloads. Refresh review bypasses the cache.'],
 };
 for (const [key, [label, hint]] of Object.entries(optionLabels)) {
@@ -166,7 +166,7 @@ form.addEventListener('submit', async event => {
   message('Saving…');
   try {
     // Request optional access directly from this user gesture, before any storage await.
-    const origins = [...(targetEnabled ? [catalog.origin] : []), ...(options.expandedContext || options.moduleReview ? ['https://api.github.com/*'] : [])];
+    const origins = [...(targetEnabled ? [catalog.origin] : []), ...(options.expandedContext ? ['https://api.github.com/*'] : [])];
     if (origins.length && !await chrome.permissions.request({ origins })) {
       message(`${catalog.label} access was not allowed. Your settings were not changed.`, true); return;
     }

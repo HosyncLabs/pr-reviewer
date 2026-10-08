@@ -121,4 +121,7 @@ test('worker persists isolated progress, caches across restart, honors budgets a
   assert.equal((await message({ type: 'progress-save', path: 'src/a.ts', note: 'do not persist' })).ok, true);
   assert.equal(JSON.stringify(stored), beforeDisabled, 'Disabled persistence never writes completion or notes');
   assert.equal((await message({ type: 'github-context', path: context.path, scope: 'module', requestId: 'disabled' })).ok, false);
+  stored['pr-reviewer:workflow'].options.moduleReview = true;
+  assert.equal((await message({ type: 'github-context', path: context.path, scope: 'module', requestId: 'loaded-module' })).ok, false, 'Module review does not opt in to the GitHub API');
+  assert.equal(requests, 1);
 });

@@ -423,3 +423,12 @@ test('settings make expanded scopes optional and preserve private GitHub credent
   assert.equal(fresh.document.querySelector<HTMLInputElement>('#workflow-expandedContext')!.checked, false);
   assert.equal(fresh.document.querySelector<HTMLInputElement>('#workflow-moduleReview')!.checked, false);
 });
+
+test('module review alone needs only the AI provider permission, without GitHub API access', async t => {
+  const page = optionsPage({ [settingsKey]: { apiKey: 'test-ai-key', model: DEFAULT_AI_MODEL, enabled: true, language: 'en' } });
+  t.after(() => page.dom.window.close()); await until(() => !page.save.disabled);
+  page.document.querySelector<HTMLInputElement>('#workflow-moduleReview')!.checked = true;
+  page.submit(); await until(() => page.counts().writes === 1 && !page.save.disabled);
+  assert.deepEqual(page.requested, [[AI_PROVIDERS.openai.origin]]);
+  assert.deepEqual(page.errors, []);
+});

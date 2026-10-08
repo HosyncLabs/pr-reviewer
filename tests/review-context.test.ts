@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { JSDOM } from 'jsdom';
 import type { PullRequestFile } from '../src/github';
-import { collectReviewContext, findReviewLine } from '../src/review-context';
+import { collectLoadedReviewContext, collectReviewContext, findReviewLine } from '../src/review-context';
+import { DEFAULT_WORKFLOW } from '../src/workflow';
 
 const firstAnchor = `diff-${'a'.repeat(64)}`;
 const secondAnchor = `diff-${'b'.repeat(64)}`;
@@ -39,6 +40,27 @@ const region = (file: PullRequestFile, rows: string) => `
   </div>`;
 const semanticRegion = (file: PullRequestFile, rows: string, codeSpan = 1) => region(file, rows).replace('<tbody>', `
   <thead><tr><th scope="col">Original file line number</th><th scope="col">Diff line number</th><th scope="col" colspan="${codeSpan}">Diff line change</th></tr></thead><tbody>`);
+
+test('loaded module context excludes drafts and unrelated packages, discloses unloaded files, and respects review limits', async t => {
+  const paths = ['packages/mira-api/src/order.ts', 'packages/mira-api/src/customer.ts', 'packages/mira-api/src/hidden.ts', 'packages/mira-widgets/src/order.tsx', 'packages/mira-editor/src/order.tsx'];
+  const files = paths.map((path, index) => ({ ...file(path, 1, 0), anchor: `diff-${String(index + 1).padStart(64, '0')}` }));
+  const dom = page(files.filter((_, index) => index !== 2).map(target => classic(target, row('+', 9, `return order;<textarea>PRIVATE_DRAFT</textarea><div class="review-thread">PRIVATE_COMMENT</div>`))).join(''), files);
+  t.after(() => dom.window.close());
+  const before = dom.window.document.body.innerHTML;
+  const loaded = await collectReviewContext(files[0], dom.window.document);
+  const context = collectLoadedReviewContext(files[0], files, loaded, 'module', [paths[3]], DEFAULT_WORKFLOW, dom.window.document);
+  assert.deepEqual(context.related?.map(item => item.path), [paths[1], paths[3]]);
+  assert.equal(context.related?.every(item => item.diff === '[new line 9] +return order;'), true);
+  assert.equal(context.partial, true); assert.match(context.warnings![0], /1 selected file had no loaded text diff/);
+  assert.equal(JSON.stringify(context).includes('PRIVATE'), false);
+  assert.equal(JSON.stringify(context).includes(paths[4]), false);
+  assert.equal(dom.window.document.body.innerHTML, before, 'Reading module context never clicks, expands, or edits GitHub');
+  const limited = collectLoadedReviewContext(files[0], files, loaded, 'module', [paths[3]], { ...DEFAULT_WORKFLOW, moduleFileLimit: 2 }, dom.window.document);
+  assert.equal(limited.related?.length, 1); assert.match(limited.warnings![0], /Review limits reached/);
+  const capped = collectLoadedReviewContext(files[0], files, { ...loaded, diff: loaded.diff + '\n' + '[new line 10] +' + 'x'.repeat(12000) }, 'module', [paths[3]], { ...DEFAULT_WORKFLOW, maxContextChars: 10000 }, dom.window.document);
+  assert.equal(capped.diff, loaded.diff); assert.equal(capped.partial, true);
+  assert.ok([capped, ...capped.related ?? []].reduce((total, item) => total + item.diff.length, 0) <= 10000);
+});
 
 test('extracts classic code with actual line numbers and markers while excluding review comments and drafts', async t => {
   const selected = file('backend/src/feature.ts', 1, 1);

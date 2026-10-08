@@ -2,7 +2,7 @@ import type { Category, ImplementationGroup } from './classifier';
 import type { RepositoryPreferences } from './storage';
 import type { WorkflowOptions, ReviewProgress } from './workflow';
 
-export const CONTENT_VERSION = '0.3.0';
+export const CONTENT_VERSION = '0.3.1';
 export const DEFAULT_AI_MODEL = 'gpt-6-luna';
 export type AIProvider = 'openai' | 'gemini' | 'claude';
 export const isAIProvider = (value: unknown): value is AIProvider => value === 'openai' || value === 'gemini' || value === 'claude';

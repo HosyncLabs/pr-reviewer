@@ -47,7 +47,7 @@
         <label for="github-token">GitHub token (optional)</label>
         <input id="github-token" type="password" maxlength="512" autocomplete="off" spellcheck="false" placeholder="Leave blank to keep your saved token">
         <p class="hint" id="github-token-state"></p>
-        <p class="hint">Expanded and module reviews use the GitHub API. Public repositories work without a token. Private repositories need a fine-grained token with Pull requests: read and Contents: read for the source repository, including forks. The token stays in trusted local extension storage; it is not sent to an AI provider.</p>
+        <p class="hint">File and module reviews use loaded Changes diffs without a GitHub token. Only optional GitHub API context uses this token. For private repositories, API context needs Pull requests: read and Contents: read for the source repository, including forks. If API access fails, the review uses loaded changes instead. The token stays in trusted local extension storage; it is not sent to an AI provider.</p>
         <button id="remove-github-token" type="button">Remove GitHub token</button>
       </details>
       <details class="settings-section"><summary>Repository checklist</summary>

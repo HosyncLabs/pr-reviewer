@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState, type MouseEvent } from 'react';
 import { AI_LANGUAGE_LABELS, AI_PROVIDERS, AI_STATUS_NOTICE, EXTENSION_RELOAD_NOTICE, isAILanguage, isAIProvider, sendExtensionMessage, type AIReviewComment, type AIReviewContext, type AIReviewLine, type AIReviewResult, type AIStatus, type ExtensionRequest } from './ai-protocol';
 import type { PullRequestFile } from './github';
-import { collectReviewContext, readHeadRevision } from './review-context';
+import { collectLoadedReviewContext, collectReviewContext, readHeadRevision } from './review-context';
 import { navigateToReviewLine, reviewLineHash } from './review-navigation';
 import { openReviewComment } from './review-comment';
 import { DEFAULT_WORKFLOW, fingerprint, blockKey, moduleFor, suggestionDraft, type WorkflowOptions, type ReviewProgress } from './workflow';
@@ -145,30 +145,27 @@ export function AiReview({ file, files, progress, onProgress, selection, compari
         if (!currentOptions.automatic && requested !== selected) return;
         if (automaticSelection.current !== selected) { automaticSelection.current = selected; onAutomatic(); }
         setPhase('reading');
-        let current: AIReviewContext;
         const loaded = await collectReviewContext(file, document, controller.signal);
         const revision = readHeadRevision() + ':' + await fingerprint(loaded.diff);
         if (controller.signal.aborted) return;
         await onProgress({ path: file.path, revision });
+        if (controller.signal.aborted) return;
         const currentScope = requested === selected ? scope : 'file';
-        if (currentOptions.expandedContext || currentScope === 'module') {
+        let current = collectLoadedReviewContext(file, filesRef.current, loaded, currentScope, relatedRef.current, currentOptions);
+        if (currentOptions.expandedContext) {
           sent = true;
           const expanded = await sendExtensionMessage({ type: 'github-context', path: file.path, scope: currentScope, relatedPaths: relatedRef.current, requestId });
           if (controller.signal.aborted) return;
-          if (!expanded.ok || !expanded.context) throw new Error(expanded.ok ? 'GitHub did not return context.' : expanded.error);
-
-          const apiLines = new Map(expanded.context.diff.split('\n').map(line => [line.match(/^\[(?:old|new) line \d+\]/)?.[0], line]));
-          const loadedLines = loaded.diff.split('\n').filter(line => /^\[(?:old|new) line \d+\]/.test(line));
-          const common = loadedLines.filter(line => apiLines.has(line.match(/^\[(?:old|new) line \d+\]/)?.[0]));
-          if (!common.length || common.some(line => apiLines.get(line.match(/^\[(?:old|new) line \d+\]/)?.[0]) !== line)) throw new Error('The loaded diff does not match the GitHub API revision. Reload GitHub, or use loaded-diff mode.');
-          const pageHead = readHeadRevision();
-          if (pageHead && expanded.context.revision !== pageHead) throw new Error('The GitHub page shows an older commit. Reload this tab before using expanded context.');
-          current = expanded.context;
-        } else {
-          current = loaded;
-          if (current.diff.length > currentOptions.maxContextChars) {
-            const shortened = current.diff.slice(0, currentOptions.maxContextChars);
-            current = { ...current, diff: shortened.slice(0, shortened.lastIndexOf('\n')), partial: true };
+          if (!expanded.ok || !expanded.context) {
+            current = { ...current, warnings: [...current.warnings ?? [], 'GitHub API context unavailable. Using loaded changes; additional source was not included. Turn off GitHub API context in Settings to use only loaded changes.'] };
+          } else {
+            const apiLines = new Map(expanded.context.diff.split('\n').map(line => [line.match(/^\[(?:old|new) line \d+\]/)?.[0], line]));
+            const loadedLines = loaded.diff.split('\n').filter(line => /^\[(?:old|new) line \d+\]/.test(line));
+            const common = loadedLines.filter(line => apiLines.has(line.match(/^\[(?:old|new) line \d+\]/)?.[0]));
+            if (!common.length || common.some(line => apiLines.get(line.match(/^\[(?:old|new) line \d+\]/)?.[0]) !== line)) throw new Error('The loaded diff does not match the GitHub API revision. Reload GitHub, or use loaded-diff mode.');
+            const pageHead = readHeadRevision();
+            if (pageHead && expanded.context.revision !== pageHead) throw new Error('The GitHub page shows an older commit. Reload this tab before using expanded context.');
+            current = expanded.context;
           }
         }
         if (controller.signal.aborted) return;
@@ -256,7 +253,7 @@ export function AiReview({ file, files, progress, onProgress, selection, compari
     {context && <p className={`ai-scope${context.partial ? ' partial' : ''}`}>{context.scope === 'module' ? 'Module analysis' : context.surrounding ? 'Diff + surrounding source' : context.revision ? 'GitHub API diff' : 'Loaded diff analyzed'}{context.partial ? ' · Partial diff' : ''} · {providerLabel} · {status?.model}{status && <> · {AI_LANGUAGE_LABELS[status.language]}</>}</p>}
     {context?.warnings?.map(warning => <p key={warning} className="ai-scope partial">{warning}</p>)}
     {review && <p className="ai-usage">{review.cached ? 'Cached review · no new AI request' : 'New analysis'}{review.usage ? ` · ${review.usage.input.toLocaleString()} input + ${review.usage.output.toLocaleString()} output tokens` : ' · Token usage unavailable'}</p>}
-    {options.moduleReview && file && <details className="module-review-controls"><summary>Module review · {moduleFor(file.path)}</summary><p>Include changed files from this module, plus optional related files below. Limits apply.</p><div className="related-file-list">{files.filter(target => target.path !== file.path && moduleFor(target.path) !== moduleFor(file.path)).map(target => <label key={target.path}><input type="checkbox" checked={relatedPaths.includes(target.path)} onChange={event => setRelatedPaths(paths => event.target.checked ? [...paths, target.path] : paths.filter(path => path !== target.path))} />{target.path}</label>)}</div><button disabled={phase === 'reading' || phase === 'generating' || !status?.enabled || !status.configured} onClick={() => { setScope('module'); setRequested(selectionKey); setRefresh(value => value + 1); }}>Analyze module</button></details>}
+    {options.moduleReview && file && <details className="module-review-controls"><summary>Module review · {moduleFor(file.path)}</summary><p>Read loaded Changes diffs from this module, plus optional related files below. No GitHub token needed. Missing files and limits are reported; optional API context can add source.</p><div className="related-file-list">{files.filter(target => target.path !== file.path && moduleFor(target.path) !== moduleFor(file.path)).map(target => <label key={target.path}><input type="checkbox" checked={relatedPaths.includes(target.path)} onChange={event => setRelatedPaths(paths => event.target.checked ? [...paths, target.path] : paths.filter(path => path !== target.path))} />{target.path}</label>)}</div><button disabled={phase === 'reading' || phase === 'generating' || !status?.enabled || !status.configured} onClick={() => { setScope('module'); setRequested(selectionKey); setRefresh(value => value + 1); }}>Analyze module</button></details>}
     {(phase === 'reading' || phase === 'generating') && <p className="ai-loading" role="status">{phase === 'reading' ? 'Reading file changes…' : 'Generating review…'}</p>}
     {error && <p className="ai-error" role="alert">{error}</p>}
     {navigationStatus && <p className="ai-navigation-status" role="status" lang="en">{navigationStatus}</p>}
@@ -273,6 +270,6 @@ export function AiReview({ file, files, progress, onProgress, selection, compari
         {review.focus.length ? <ul className="ai-comments">{review.focus.map((item, index) => <ReviewBlock key={`${blockKey(item)}:${index}`} item={item} blockState={marks[blockIds[blockKey(item)]]} onMark={state => mark(item, state)} options={options} files={files} file={file} jump={(event, reference) => void jump(event, reference)} addComment={addComment} />)}</ul> : <p lang="en">No specific focus points identified in the loaded diff.</p>}
       </section>
     </div>}
-    <p className="ai-disclosure">{context?.scope === 'module' ? 'Selected module diffs and optional surrounding source are sent to' : options.expandedContext ? 'This file’s API diff and surrounding source are sent to' : "Only this file's loaded diff is sent to"} {providerLabel}. API usage is billed to your provider account.</p>
+    <p className="ai-disclosure">{context?.scope === 'module' ? context.revision ? 'Selected module API diffs and optional surrounding source are sent to' : 'Selected loaded module diffs are sent to' : context?.revision ? 'This file’s API diff and optional surrounding source are sent to' : "Only this file's loaded diff is sent to"} {providerLabel}. API usage is billed to your provider account.</p>
   </section>;
 }

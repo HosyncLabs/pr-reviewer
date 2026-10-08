@@ -1,6 +1,6 @@
 import { getPullRequest, isPullRequestView, readFiles, type PullRequestFile } from './github';
-import { fingerprint } from './workflow';
-import type { AIReviewLine } from './ai-protocol';
+import { fingerprint, moduleFor, type WorkflowOptions } from './workflow';
+import type { AIReviewContext, AIReviewLine } from './ai-protocol';
 
 export type ReviewContext = { path: string; diff: string; partial: boolean };
 
@@ -258,6 +258,42 @@ export async function collectReviewContext(
     signal?.addEventListener('abort', abort, { once: true });
     check();
   });
+}
+
+export function collectLoadedReviewContext(
+  file: PullRequestFile,
+  files: PullRequestFile[],
+  loaded: ReviewContext,
+  scope: 'file' | 'module',
+  relatedPaths: string[],
+  options: WorkflowOptions,
+  document: Document = globalThis.document,
+): AIReviewContext {
+  const candidates = scope === 'module' ? [file, ...files.filter(target => target.path !== file.path &&
+    (moduleFor(target.path) === moduleFor(file.path) || relatedPaths.includes(target.path)))] : [file];
+  const contexts: AIReviewContext[] = [];
+  const warnings: string[] = [];
+  let remaining = options.maxContextChars, unavailable = 0;
+  for (const target of candidates) {
+    if (contexts.length >= options.moduleFileLimit || remaining < 1000) {
+      warnings.push('Review limits reached; some selected files were omitted.'); break;
+    }
+    const selected = target.path === file.path ? null : selectedDiff(target, document);
+    const context = target.path === file.path ? loaded : selected && extract(selected.target, selected.current);
+    if (!context) { unavailable++; continue; }
+    let diff = context.diff;
+    if (diff.length > remaining) {
+      diff = diff.slice(0, remaining);
+      const end = diff.lastIndexOf('\n');
+      if (end >= 0) diff = diff.slice(0, end);
+    }
+    contexts.push({ ...context, diff, partial: context.partial || diff !== context.diff });
+    remaining -= diff.length;
+  }
+  if (unavailable) warnings.push(`${unavailable} selected file${unavailable === 1 ? '' : 's'} had no loaded text diff. Load or expand them in GitHub, then refresh the review.`);
+  return { ...contexts[0], ...(scope === 'module' ? { scope, related: contexts.slice(1) } : {}),
+    partial: contexts.some(context => context.partial) || warnings.length > 0,
+    ...(warnings.length ? { warnings } : {}) };
 }
 
 export function readHeadRevision(document: Document = globalThis.document): string {

@@ -1491,18 +1491,23 @@ test('manual workflow saves notes and progress, skips reviewed files, dismisses 
   await until(() => [...nextShadow.querySelectorAll<HTMLButtonElement>('.file-reviewed')].some(button => button.textContent === '✓ File reviewed'), 'file progress survives reload');
 });
 
-test('module analysis follows references across packages and rejects a mismatched API revision', async t => {
+for (const apiContext of [false, true]) test(apiContext ? 'module analysis follows references across packages and rejects a mismatched API revision' : 'module analysis reads Changes without GitHub API access and follows references across packages', async t => {
   const fixturePaths = ['packages/mira-api/src/order.ts', 'packages/mira-widgets/src/order.tsx'];
   const route = '/acme/example/pull/12/files';
   const html = `<a class="tabnav-tab" href="${route}"><span id="files_tab_counter">2</span></a>${fixturePaths.map((path, index) => `<section id="${anchor(index)}" data-tagsearch-path="${path}"><div class="file-header" data-path="${path}" data-anchor="${anchor(index)}"><a title="${path}" href="#${anchor(index)}">${path}</a></div><table><tr><td id="${anchor(index)}R1" class="blob-num" data-line-number="1">1</td><td class="blob-code blob-code-addition"><span class="blob-code-inner" data-code-marker="+">return input;</span></td></tr></table></section>`).join('')}`;
-  let mismatched = false, calls = 0;
+  let mismatched = false, calls = 0, apiCalls = 0;
   const current = page(undefined, {}, html, async message => {
-    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture', language: 'en', options: { ...DEFAULT_WORKFLOW, automatic: false, moduleReview: true } } };
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture', language: 'en', options: { ...DEFAULT_WORKFLOW, automatic: false, moduleReview: true, expandedContext: apiContext } } };
     if (message.type === 'github-context') {
+      apiCalls++; assert.equal(apiContext, true);
       assert.deepEqual(Array.from(message.relatedPaths ?? []), [fixturePaths[1]]); assert.equal(message.scope, 'module');
       return { ok: true, context: { path: fixturePaths[0], diff: '[new line 1] +' + (mismatched ? 'stale' : 'return input;'), partial: false, scope: 'module', related: [{ path: fixturePaths[1], diff: '[new line 1] +return input;', partial: false }] } };
     }
-    if (message.type === 'ai-review') { calls++; return { ok: true, review: { summary: 'Checks the package contract.', highlights: [{ text: 'Verify the widget caller.', lines: [{ path: fixturePaths[1], side: 'right', line: 1 }] }], focus: [] } }; }
+    if (message.type === 'ai-review') {
+      calls++; assert.equal(message.context.scope, 'module'); assert.equal(message.context.diff, '[new line 1] +return input;');
+      assert.equal(message.context.related?.[0].path, fixturePaths[1]); assert.equal(message.context.related?.[0].diff, '[new line 1] +return input;');
+      return { ok: true, review: { summary: 'Checks the package contract.', highlights: [{ text: 'Verify the widget caller.', lines: [{ path: fixturePaths[1], side: 'right', line: 1 }] }], focus: [] } };
+    }
   }); t.after(() => current.dom.window.close());
   const shadow = await openPanel(current.window); links(shadow).find(link => link.title === fixturePaths[0])!.click();
   const button = (name: string) => [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === name)!;
@@ -1514,9 +1519,41 @@ test('module analysis follows references across packages and rejects a mismatche
   assert.equal(chip.getAttribute('href'), `#${anchor(1)}R1`); chip.click();
   await until(() => current.window.location.hash === `#${anchor(1)}R1`, 'related package line navigation');
   assert.equal(shadow.querySelector('.ai-file')!.textContent, fixturePaths[0], 'Line jumps preserve the module analysis');
-  mismatched = true; button('Refresh review').click();
-  await until(() => shadow.querySelector('.ai-error')?.textContent?.includes('does not match'), 'stale API revision rejection');
-  assert.equal(calls, 1, 'A mismatched API context must not be sent to AI');
+  assert.equal(apiCalls, apiContext ? 1 : 0);
+  if (apiContext) {
+    mismatched = true; button('Refresh review').click();
+    await until(() => shadow.querySelector('.ai-error')?.textContent?.includes('does not match'), 'stale API revision rejection');
+    assert.equal(calls, 1, 'A mismatched API context must not be sent to AI');
+  }
+  assert.deepEqual(current.errors, []);
+});
+
+for (const scope of ['file', 'module'] as const) test(`${scope} review falls back to loaded Changes when private GitHub API access fails`, async t => {
+  const path = 'backend/src/api/v1/orders/index.ts';
+  let calls = 0;
+  const html = `<a class="tabnav-tab" href="/acme/example/pull/12/files"><span id="files_tab_counter">1</span></a><section id="${anchor(0)}" data-tagsearch-path="${path}"><div class="file-header" data-path="${path}" data-anchor="${anchor(0)}"><a title="${path}" href="#${anchor(0)}">${path}</a></div><table><tr><td class="blob-num" data-line-number="17">17</td><td class="blob-code"><span class="blob-code-inner" data-code-marker="+">return input;</span></td></tr></table><textarea>PRIVATE_DRAFT</textarea></section>`;
+  const current = page(undefined, {}, html, async message => {
+    if (message.type === 'ai-status') return { ok: true, status: { configured: true, enabled: true, model: 'fixture', language: 'en', options: { ...DEFAULT_WORKFLOW, automatic: false, expandedContext: true, moduleReview: true } } };
+    if (message.type === 'github-context') { assert.equal(message.scope, scope); return { ok: false, error: 'GitHub API access failed. For private repositories, add a token with Pull requests and Contents read access in Settings.' }; }
+    if (message.type === 'ai-review') {
+      calls++; assert.equal(message.context.diff, '[new line 17] +return input;');
+      assert.equal(message.context.surrounding, undefined); assert.equal(message.context.revision, undefined);
+      assert.equal(JSON.stringify(message.context).includes('PRIVATE_DRAFT'), false);
+      return { ok: true, review: { summary: 'Reviews loaded changes.', highlights: [{ text: 'Check input.', lines: [{ side: 'right', line: 17 }] }], focus: [] } };
+    }
+  }); t.after(() => current.dom.window.close());
+  const shadow = await openPanel(current.window); links(shadow).find(link => link.title === path)!.click();
+  const button = (name: string) => [...shadow.querySelectorAll<HTMLButtonElement>('button')].find(button => button.textContent === name)!;
+  button('AI review').click(); await until(() => button('Analyze file'), 'manual analysis ready');
+  if (scope === 'module') shadow.querySelector<HTMLDetailsElement>('.module-review-controls')!.open = true;
+  button(scope === 'module' ? 'Analyze module' : 'Analyze file').click();
+  await until(() => shadow.querySelector('.ai-result'), 'loaded-diff fallback review');
+  assert.equal(calls, 1); assert.equal(shadow.querySelector('.ai-error'), null);
+  assert.match(shadow.textContent!, /GitHub API context unavailable. Using loaded changes/);
+  assert.match(shadow.querySelector('.ai-disclosure')!.textContent!, /loaded/);
+  assert.equal(shadow.querySelector('.ai-disclosure')!.textContent!.includes('surrounding source'), false);
+  assert.equal(shadow.querySelector<HTMLAnchorElement>('.ai-line-chip')!.getAttribute('href'), `#${anchor(0)}R17`);
+  assert.equal(current.window.document.querySelector('textarea')!.value, 'PRIVATE_DRAFT');
   assert.deepEqual(current.errors, []);
 });
 

@@ -280,7 +280,7 @@ export async function handleExtensionMessage(message: unknown, sender: chrome.ru
     if (request.type === 'github-context') {
       const workflow = await loadWorkflowTrusted();
       if (!pr.isFilesPage || !validPath(request.path) || !validRequestId(request.requestId) || !['file', 'module'].includes(String(request.scope)) ||
-        request.scope === 'module' && !workflow.options.moduleReview || request.scope === 'file' && !workflow.options.expandedContext ||
+        !workflow.options.expandedContext || request.scope === 'module' && !workflow.options.moduleReview ||
         !Array.isArray(request.relatedPaths ?? []) || (request.relatedPaths as unknown[] | undefined)?.some(path => !validPath(path)) ||
         ((request.relatedPaths ?? []) as unknown[]).length > 100) return error('Enable this review scope in Settings first.');
       const url = new URL(sender.url!);
